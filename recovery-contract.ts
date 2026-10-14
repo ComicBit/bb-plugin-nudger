@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import type { JevConsequence } from "./detectors.js";
 
 /** Public history DTO, inferred without importing the SDK's internal type name. */
 export type ThreadEventRow = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["events"]["list"]>>[number];
@@ -121,6 +122,10 @@ export interface RecoveryBlocker {
   kind: "blocker" | "permission" | "uncertainty";
   finalAssistantMessage: string;
   observedAt: number;
+  /** Jev's consequence answer; absent for judgments made before the question existed. */
+  consequence?: JevConsequence;
+  /** Jev's `ending` answer is `request`: the agent ended asking the operator for something. */
+  operatorRequest?: boolean;
 }
 
 export interface RecoveryInventoryThread {
@@ -210,6 +215,11 @@ export interface RecoveryService {
    * an earlier manual Stop no longer suppresses that thread's later endings. Stops after `at` still apply.
    */
   rearm(threadId: string, at: number): void;
+  /**
+   * Replaces a retained record's judgment (a re-judgment of its recorded text): finished → `finished`, continue →
+   * `suppressed` (never dispatched), an obstacle keeps its action. Resolves the updated record, or null when it is gone.
+   */
+  rejudge(recordId: string, judgment: FinalMessageJudgment): Promise<RecoveryRecord | null>;
   /** The v1 history view: the records Headquarters and stats read (see historyRecordIds), without decision-log fields. */
   records(): RecoveryRecord[];
   /** One page of the decision log, oldest first: after `cursor`, observed at or after `since`. */

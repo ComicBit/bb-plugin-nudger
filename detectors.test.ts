@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createJevDetector, routeJevAnswers, runShadowComparison } from "./detectors.js";
+import { createJevDetector, jevBlockerFacts, routeJevAnswers, runShadowComparison } from "./detectors.js";
 import { JEV_NO_CREDITS } from "./continuation-copy.js";
 import type { FinalMessageClassifier, FinalMessageJudgment } from "./recovery-contract.js";
 import { RECOVERY_SHADOW_CORPUS } from "./recovery-shadow-corpus.js";
@@ -46,6 +46,32 @@ test("Jev requires the higher continuation threshold even when both judgments cl
     boundary: { type: "choice", choice: "continue", confidence: 0.8, probabilities: { continue: 0.9, finished: 0.05, uncertainty: 0.05 } },
   });
   assert.equal(result.classification, "uncertainty");
+});
+
+test("an ending reporting a state the operator chose is settled: not an obstacle, not work to nudge", () => {
+  const obstacle = { type: "choice" as const, choice: "uncertainty" as const, confidence: 0.9, probabilities: { none: 0.05, blocker: 0.03, permission: 0.02, uncertainty: 0.9 } };
+  const boundary = { type: "choice" as const, choice: "continue" as const, confidence: 0.95, probabilities: { continue: 0.95, finished: 0.03, uncertainty: 0.02 } };
+  const ending = (choice: "request" | "operator_chosen" | "report", confidence: number) => ({ type: "choice" as const, choice, confidence, probabilities: { request: 0, operator_chosen: 0, report: 0, [choice]: confidence } });
+  // "Understood: the Jev arcade is frozen. I won't restore or request the credential."
+  assert.deepEqual(routeJevAnswers({ obstacle, boundary, ending: ending("operator_chosen", 0.8) }), { classification: "finished", confidence: 0.8 });
+  assert.equal(routeJevAnswers({ obstacle: { ...obstacle, choice: "none", confidence: 0.95 }, boundary, ending: ending("operator_chosen", 0.8) }).classification, "finished");
+  // Below the confidence floor, or a real request, the obstacle reading stands.
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: ending("operator_chosen", 0.5) }).classification, "uncertainty");
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: ending("request", 0.9) }).classification, "uncertainty");
+});
+
+test("the detector keeps ending and consequence answers, which become blocker facts; older judgments have none", async () => {
+  const detector = createJevDetector({ apiKey: "test-key", fetch: async () => new Response(JSON.stringify({ model: "jev-1.13.0", answers: {
+    obstacle: { type: "choice", choice: "permission", confidence: 0.9, probabilities: { none: 0.05, blocker: 0.03, permission: 0.9, uncertainty: 0.02 } },
+    boundary: { type: "choice", choice: "continue", confidence: 0.6, probabilities: { continue: 0.6, finished: 0.2, uncertainty: 0.2 } },
+    ending: { type: "choice", choice: "request", confidence: 0.9, probabilities: { request: 0.9, operator_chosen: 0.05, report: 0.05 } },
+    consequence: { type: "choice", choice: "money", confidence: 0.8, probabilities: { money: 0.8, data: 0.05, production: 0.05, "priority-product": 0.04, irreversible: 0.03, none: 0.03 } },
+  } })) });
+  const result = await detector.classify("Provisioning needs a paid instance. Please authorize the charge.");
+  assert.equal(result.classification, "permission");
+  assert.deepEqual(jevBlockerFacts(result.questions), { consequence: "money", operatorRequest: true });
+  assert.deepEqual(jevBlockerFacts(null), {});
+  assert.deepEqual(jevBlockerFacts({ obstacle: { choice: "blocker", confidence: 1, probabilities: {} } }), {});
 });
 
 test("malformed Jev output does not become a default continuation", async () => {

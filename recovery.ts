@@ -7,6 +7,7 @@ import { createKvWriter } from "./kv-writer.js";
 import { WORKFLOW_SETTLE_MS, workflowOwner, workflowStepRunning } from "./workflow-steps.js";
 import { LEGACY_DATA_PREFIX, retainedKeys, retainedValue } from "./migration-storage.js";
 import { DECISION_LIMITS, decisionCursor, decisionsAfter, decodeText, encodeText, GATE, historyRecord, historyRecordIds, noneOutcome, nudgeGate, operatorCancelled, OUTCOME_WINDOW_MS, planRetention, RECORD_KEY, TEXT_KEY, toDecision } from "./decision-log.js";
+import { jevBlockerFacts } from "./detectors.js";
 import { PAGE_BYTES } from "./publication.js";
 type ThreadResponse = PluginThreadEventPayloads["thread.idle"]["thread"];
 
@@ -559,7 +560,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
           if (judgment.classification === "continue" || judgment.classification === "finished") return null;
           return { recordId: record.id, threadId: record.threadId, projectId: record.projectId, runId: record.runId,
             messageId: record.messageId, messageRevision: record.messageRevision, kind: judgment.classification,
-            finalAssistantMessage: ending.finalMessage!.text, observedAt: record.observedAt };
+            finalAssistantMessage: ending.finalMessage!.text, observedAt: record.observedAt, ...jevBlockerFacts(judgment.questions) };
         });
         if (!blocker) return;
         // Pause/configuration/Stop/disposal can happen while persistence is awaited.
@@ -910,6 +911,19 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       });
     },
     noteNudge,
+    rejudge(recordId, judgment) {
+      return serial(async () => {
+        const record = recordsById.get(recordId);
+        if (!record) return null;
+        record.judgment = judgment;
+        record.classification = judgment.classification;
+        if (judgment.classification === "finished") decide(record, "finished", GATE.rejudged, "Re-judged after reload: finished; no continuation dispatched");
+        else if (judgment.classification === "continue") decide(record, "suppressed", GATE.rejudged, "Re-judged after reload: not an obstacle; no continuation dispatched");
+        await persist(record);
+        changed();
+        return historyRecord(record);
+      });
+    },
     cursor(threadId): RecoveryCursor | null {
       const cursor = cursors.get(threadId);
       if (disposed || !initialized || !cursor || inventory.get(threadId)?.exclusion !== null) return null;

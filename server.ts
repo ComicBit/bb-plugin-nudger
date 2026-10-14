@@ -8,7 +8,7 @@ import { CANCEL_REASON, nudgeRejectMessage } from "./continuation-copy.js";
 import { continuationStatus, type ContinuationStatus } from "./continuation-status.js";
 import { createRecoveryService } from "./recovery.js";
 import type { RecoveryBlocker, RecoveryRecord, RecoveryService } from "./recovery-contract.js";
-import { createJevDetector, runShadowComparison, type ShadowComparison } from "./detectors.js";
+import { createJevDetector, jevBlockerFacts, runShadowComparison, type ShadowComparison } from "./detectors.js";
 import { createUsageLedger, meteredDetector, type UsageLedger } from "./detector-usage.js";
 import { createRecoveryVerifier } from "./verification.js";
 import { createHeadquartersPeer } from "./headquarters.js";
@@ -191,6 +191,28 @@ export default function plugin(bb: BbPluginApi) {
     return text;
   }
   /**
+   * Retained obstacles judged before the `ending`/`consequence` questions existed are judged once more after a reload,
+   * from the same recorded final message, so old "decisions" that only reported an operator-chosen state settle. Bounded:
+   * a few per read, a fixed number per process, each record at most once, and only while Jev is selected and unpaused.
+   */
+  const REJUDGE_PER_READ = 5;
+  let rejudgeBudget = 25;
+  const rejudged = new Set<string>();
+  async function rejudgeRetained(record: RecoveryRecord, text: string): Promise<RecoveryRecord> {
+    if (rejudgeBudget <= 0 || !operational || recovery!.status().paused) return record;
+    // Claimed before any await, so concurrent snapshot and stats reads never judge the same ending twice.
+    rejudged.add(record.id);
+    const config = await settings.get();
+    if (!config.enabled || config.detector !== "jev" || !config.typesafeApiKey) { rejudged.delete(record.id); return record; }
+    rejudgeBudget--;
+    try {
+      return await recovery!.rejudge(record.id, await jev(config.typesafeApiKey).classify(text, { signal })) ?? record;
+    } catch (cause) {
+      if (!signal.aborted) bb.log.warn(`Nudger could not re-judge retained ending ${record.id}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return record;
+    }
+  }
+  /**
    * Obstacles that current public thread state still confirms. Ones captured by this runtime come first; after a
    * restart, each thread's newest retained obstacle is rebuilt from its exact recorded final message and admitted
    * through the same validation, so a reload never empties Needs your attention. Stale ones are dropped.
@@ -202,14 +224,22 @@ export default function plugin(bb: BbPluginApi) {
       const known = latest.get(record.threadId);
       if (!known || record.observedAt >= known.observedAt) latest.set(record.threadId, record);
     }
-    for (const record of latest.values()) {
-      if (blockers.has(record.threadId) || record.action !== "reported") continue;
-      const kind = record.classification;
-      if (kind !== "blocker" && kind !== "permission" && kind !== "uncertainty") continue;
-      const text = await recordedMessage(record);
+    let rejudgesLeft = REJUDGE_PER_READ;
+    for (const retained of latest.values()) {
+      if (blockers.has(retained.threadId) || retained.action !== "reported") continue;
+      if (retained.classification !== "blocker" && retained.classification !== "permission" && retained.classification !== "uncertainty") continue;
+      const text = await recordedMessage(retained);
       if (!text) continue;
+      const stale = !retained.judgment?.questions?.ending && !rejudged.has(retained.id);
+      const record = stale && rejudgesLeft-- > 0 ? await rejudgeRetained(retained, text) : retained;
+      const kind = record.classification;
+      // Another read or a live report may have published this thread while the judgment was awaited.
+      const published = blockers.get(record.threadId);
+      if (published && published.recordId !== record.id) continue;
+      if (record.action !== "reported" || (kind !== "blocker" && kind !== "permission" && kind !== "uncertainty")) { if (published) blockers.delete(record.threadId); continue; }
       blockers.set(record.threadId, { recordId: record.id, threadId: record.threadId, projectId: record.projectId, runId: record.runId,
-        messageId: record.messageId, messageRevision: record.messageRevision, kind, finalAssistantMessage: text, observedAt: record.observedAt });
+        messageId: record.messageId, messageRevision: record.messageRevision, kind, finalAssistantMessage: text, observedAt: record.observedAt,
+        ...jevBlockerFacts(record.judgment?.questions ?? null) });
     }
     const live: RecoveryBlocker[] = [];
     for (const [threadId, blocker] of blockers) {

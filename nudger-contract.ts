@@ -22,6 +22,7 @@ export const recordSchema = z.object({
 export const blockerSchema = z.object({
   recordId: id, threadId: id, projectId: id, runId: id, messageId: id, messageRevision: count,
   kind: z.enum(["blocker", "permission", "uncertainty"]), finalAssistantMessage: z.string().max(24576), observedAt: timestamp,
+  consequence: z.enum(["money", "data", "production", "priority-product", "irreversible", "none"]).optional(), operatorRequest: z.boolean().optional(),
 });
 export const statusSchema = z.object({
   enabled: z.boolean(), observing: z.boolean(), classifying: z.boolean(), paused: z.boolean(), detectorId: z.string().max(200).nullable(),

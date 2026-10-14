@@ -79,10 +79,15 @@ function fixture(options: { settings?: Record<string, string | boolean>; headqua
   }
   return { bb, harness, threads, history, controls, snapshot, dispatch, finish, until };
 }
-function jevResponse(classification: "continue" | "blocker" | "finished") {
+/** `ending: null` answers in the shape judgments had before the `ending`/`consequence` questions existed. */
+function jevResponse(classification: "continue" | "blocker" | "finished", ending: "request" | "operator_chosen" | "report" | null = "report") {
   return new Response(JSON.stringify({ model: "jev-1.13.0", answers: {
     obstacle: { type: "choice", choice: classification === "blocker" ? "blocker" : "none", confidence: 1, probabilities: { none: classification === "blocker" ? 0 : 1, blocker: classification === "blocker" ? 1 : 0, permission: 0, uncertainty: 0 } },
     boundary: { type: "choice", choice: classification === "finished" ? "finished" : "continue", confidence: 1, probabilities: { continue: classification === "finished" ? 0 : 1, finished: classification === "finished" ? 1 : 0, uncertainty: 0 } },
+    ...ending && {
+      ending: { type: "choice", choice: ending, confidence: 1, probabilities: { request: 0, operator_chosen: 0, report: 0, [ending]: 1 } },
+      consequence: { type: "choice", choice: "none", confidence: 1, probabilities: { money: 0, data: 0, production: 0, "priority-product": 0, irreversible: 0, none: 1 } },
+    },
   }, usage: { input_tokens: 42, output_tokens: 3 } }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
@@ -197,6 +202,23 @@ test("a still-current reported obstacle survives a plugin reload with its own fi
   const restored = snapshotSchema.parse(await current.callRpc("nudger_snapshot_v1", { version: 1 }));
   assert.deepEqual(restored.blockers.map(blocker => [blocker.threadId, blocker.kind, blocker.finalAssistantMessage]), [["worker", "blocker", "Required credential is unavailable."]]);
   assert.equal(fetch.mock.callCount(), 1); assert.equal(h.controls.sends, 0);
+});
+
+test("a retained obstacle judged before the ending question is re-judged once after reload, and settles if the operator chose that state", async t => {
+  const answers = [jevResponse("blocker", null), jevResponse("blocker", "operator_chosen")];
+  const fetch = t.mock.method(globalThis, "fetch", async () => answers.shift() ?? jevResponse("blocker"));
+  const h = fixture({ settings: { detector: "jev", typesafeApiKey: "offline-key" } });
+  let current = h.harness; t.after(() => current.dispose());
+  await h.snapshot(); await h.finish("Understood: the arcade is frozen. I won't restore or request the credential.");
+  const before = await h.until(value => value.blockers.length === 1);
+  assert.equal(before.blockers[0]!.consequence, undefined);
+  const replacement = await current.reload(plugin); current = replacement.harness;
+  const read = async () => snapshotSchema.parse(await current.callRpc("nudger_snapshot_v1", { version: 1 }));
+  const restored = await read();
+  assert.deepEqual(restored.blockers, []);
+  assert.equal(restored.records.find(record => record.threadId === "worker")!.action, "finished");
+  await read();
+  assert.equal(fetch.mock.callCount(), 2); assert.equal(h.controls.sends, 0);
 });
 
 test("factory loading rejects owned submissions, while an unavailable legacy key keeps classification gated", async t => {
