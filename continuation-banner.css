@@ -1,0 +1,158 @@
+/* Composer banner: sits in BB's own chat chrome, so it uses the host theme tokens (with fallbacks) and nothing from the dashboard. */
+/* Liquid Glass pills mode hides the whole banner stack while no pill is open; keep it showing when this line is in it. */
+[data-lg-dock-collapsed] > .grid[data-lg-dock-empty]:has(.nudger-cb) { display: grid; }
+.nudger-cb {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 28px;
+  margin-bottom: 2px;
+  padding: 2px 8px 5px 2px;
+  color: var(--muted-foreground, #9a9ea6);
+  font-size: 12px;
+  line-height: 16px;
+}
+.nudger-cb[data-state="countdown"] { color: var(--foreground, #e8eaee); }
+
+/* The per-thread toggle: a 16px eye centred in a 24px hit area, open while auto-continue watches the thread, closed when off.
+   The hit area's 4px inset plus the 2px row gap puts the line 6px right of the eye. */
+.nudger-cb-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground, #8b929e);
+  cursor: pointer;
+  transition: background-color 160ms ease-out;
+}
+.nudger-cb-toggle:hover:not(:disabled) { background: color-mix(in oklab, currentColor 10%, transparent); }
+.nudger-cb-toggle:focus-visible { outline: 2px solid var(--ring, #91baff); outline-offset: -2px; }
+.nudger-cb-toggle:disabled { cursor: default; }
+.nudger-cb-eye {
+  display: block;
+  flex: none;
+  overflow: visible;
+  opacity: .55;
+  transition: opacity 160ms ease-out;
+}
+.nudger-cb-toggle[aria-pressed="true"] .nudger-cb-eye { opacity: .9; }
+.nudger-cb-toggle:hover:not(:disabled) .nudger-cb-eye { opacity: 1; }
+.nudger-cb[data-state="assessing"] .nudger-cb-eye { animation: nudger-cb-pulse 1.4s ease-in-out infinite; }
+/* The two glyphs crossfade; the open eye also opens its lid from the centre line, and squashes back to it when closing. */
+.nudger-cb-eye-closed { transition: opacity 160ms ease-out; }
+.nudger-cb-eye-open {
+  transform-box: view-box;
+  transform-origin: 50% 50%;
+  transform: scaleY(.15);
+  opacity: 0;
+  transition: opacity 160ms ease-out, transform 180ms cubic-bezier(.22, 1, .36, 1);
+}
+.nudger-cb-toggle[aria-pressed="true"] .nudger-cb-eye-open { transform: none; opacity: 1; }
+.nudger-cb-toggle[aria-pressed="true"] .nudger-cb-eye-closed { opacity: 0; }
+
+/* The line: each new line slides in from the left while the old one slides out to the right, placed over it so nothing jumps. */
+.nudger-cb-lines { position: relative; display: block; min-width: 0; overflow-wrap: anywhere; }
+.nudger-cb-text {
+  display: block;
+  transition: opacity 260ms cubic-bezier(.22, 1, .36, 1), transform 260ms cubic-bezier(.22, 1, .36, 1);
+}
+@starting-style {
+  .nudger-cb-text { opacity: 0; transform: translateX(-8px); }
+}
+.nudger-cb-text[data-leaving] {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  translate: 0 -50%;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(8px);
+  transition-duration: 200ms;
+}
+.nudger-cb[data-state="countdown"] .nudger-cb-text { font-variant-numeric: tabular-nums; }
+/* The quieter second half of the line. */
+.nudger-cb-detail { opacity: .6; }
+.nudger-cb-cancel {
+  flex: none;
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: calc(var(--radius, .5rem) - 2px);
+  background: transparent;
+  color: var(--muted-foreground, #9a9ea6);
+  font: inherit;
+  cursor: pointer;
+}
+.nudger-cb-cancel:hover:not(:disabled) { background: var(--state-hover, #ffffff0f); color: var(--foreground, #e8eaee); }
+.nudger-cb-cancel:focus-visible { outline: 2px solid var(--ring, #91baff); outline-offset: 1px; }
+.nudger-cb-cancel:disabled { cursor: default; opacity: .5; }
+.nudger-cb-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* The nudge counter mirrors the eye on the right: the count, then a 16px hand, 6px from the banner's edge like the eye. */
+.nudger-cb-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  margin-right: -2px;
+  color: var(--muted-foreground, #8b929e);
+  font-variant-numeric: tabular-nums;
+  opacity: .9;
+  cursor: default;
+  transition: opacity 260ms cubic-bezier(.22, 1, .36, 1), transform 260ms cubic-bezier(.22, 1, .36, 1);
+}
+.nudger-cb-cancel + .nudger-cb-count { margin-left: 4px; }
+.nudger-cb-hand { display: block; flex: none; overflow: visible; }
+/* A new count slides in like a new line. */
+.nudger-cb-count-value { display: block; transition: opacity 260ms cubic-bezier(.22, 1, .36, 1), transform 260ms cubic-bezier(.22, 1, .36, 1); }
+@starting-style {
+  .nudger-cb-count,
+  .nudger-cb-count-value { opacity: 0; transform: translateX(-8px); }
+}
+
+/* Countdown: a 2px bar along the banner's bottom edge, just above the composer, draining as the seconds run out. */
+.nudger-cb-bar {
+  position: absolute;
+  right: 4px;
+  bottom: 0;
+  left: 4px;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: var(--border, #ffffff1f);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.nudger-cb-bar > span { display: block; height: 100%; background: var(--primary, currentColor); transform-origin: left; transition: transform 250ms linear; }
+.nudger-cb[data-state="countdown"] .nudger-cb-bar { opacity: 1; }
+/* A banner that mounts mid-countdown (thread switch, reload) fades its bar in too. */
+@starting-style {
+  .nudger-cb[data-state="countdown"] .nudger-cb-bar { opacity: 0; }
+}
+
+@keyframes nudger-cb-pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .nudger-cb-bar > span { transition: none; }
+  .nudger-cb[data-state="assessing"] .nudger-cb-eye { animation: none; }
+  /* The eye only crossfades between open and closed; lines fade without sliding. */
+  .nudger-cb-toggle .nudger-cb-eye-open { transform: none; transition: opacity 160ms ease-out; }
+  .nudger-cb-text,
+  .nudger-cb-text[data-leaving],
+  .nudger-cb-count,
+  .nudger-cb-count-value { transform: none; transition: opacity 120ms ease; }
+  @starting-style {
+    .nudger-cb-text,
+    .nudger-cb-count,
+    .nudger-cb-count-value { transform: none; }
+  }
+}

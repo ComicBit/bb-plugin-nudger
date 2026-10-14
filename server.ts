@@ -1,0 +1,344 @@
+import type { BbPluginApi, ExperimentalPluginRpcHandlerContext } from "@get-bb/plugin-sdk";
+import { setInterval as every } from "node:timers/promises";
+import { createContinuation, type Continuation } from "./continuation.js";
+import { CANCEL_REASON, nudgeRejectMessage } from "./continuation-copy.js";
+import { continuationStatus, type ContinuationStatus } from "./continuation-status.js";
+import { createRecoveryService } from "./recovery.js";
+import type { RecoveryBlocker, RecoveryRecord, RecoveryService } from "./recovery-contract.js";
+import { createJevDetector, runShadowComparison, type ShadowComparison } from "./detectors.js";
+import { createUsageLedger, meteredDetector, type UsageLedger } from "./detector-usage.js";
+import { createRecoveryVerifier } from "./verification.js";
+import { createHeadquartersPeer } from "./headquarters.js";
+import { migrateHeadquarters, MIGRATION_KEY } from "./migration.js";
+import { LEGACY_ACTIVATION_KEY, LEGACY_SETTINGS_KEY, retainedValue, type ImportedSettings } from "./migration-storage.js";
+import { boundedRows, historyPage, historyVersion } from "./publication.js";
+import { rpcContract } from "./rpc-contract.js";
+import { snapshotSchema } from "./nudger-contract.js";
+import { type NudgerConfiguration } from "./rpc-contract.js";
+import { computeStats } from "./stats.js";
+
+const LUNA_REMOVED = "Luna was removed; select Jev. Enter your TypeSafe key in Nudger settings, then select Jev. Until then Nudger only observes.";
+
+/** Factory registration is synchronous and inert; only the passive background service loads native inventory. */
+export default function plugin(bb: BbPluginApi) {
+  const lifetime = new AbortController();
+  const signal = lifetime.signal;
+  // Omitted fields stay distinguishable from explicit values during migration. Effective detector defaults to none.
+  const settings = bb.settings.define({
+    enabled: { type: "boolean", label: "Enable automatic continuation", description: "Off keeps passive inventory and banners running without classification or dispatch.", default: true },
+    detector: { type: "select", label: "Detector", options: ["none", "jev"], experimental_optionLabels: { none: "None — observe only", jev: "Jev — TypeSafe API" },
+      description: "None only observes: no model calls, no messages. Jev reads only a new live run's final assistant message. Migration stays passive: select Jev after entering its key." },
+    typesafeApiKey: { type: "string", label: "TypeSafe API key", secret: true, description: "Required for Jev. Never sent to the settings screen; Headquarters' encrypted key is preserved, not copied." },
+  });
+  const peer = createHeadquartersPeer(bb, signal);
+  let recovery: RecoveryService | null = null;
+  let continuation: Continuation | null = null;
+  let usage: UsageLedger = createUsageLedger({ store: bb.storage.kv, warn: message => bb.log.warn(message) });
+  let ready: Promise<void> | null = null;
+  let initializing = false;
+  let operational = false;
+  let configurationError: string | null = null;
+  let configuredSignature: string | null = null;
+  let settingsRevision = 0;
+  let changes: Promise<unknown> = Promise.resolve();
+  let closing: Promise<void> | null = null;
+  let publishTimer: NodeJS.Timeout | undefined;
+  let cachedHistory: { records: ReturnType<RecoveryService["records"]>; version: string } | null = null;
+  const blockers = new Map<string, RecoveryBlocker>();
+  const bannerReads = new Map<string, { at: number; fingerprint: string }>();
+  function serial<T>(operation: () => Promise<T>): Promise<T> {
+    const result = changes.catch(() => undefined).then(operation);
+    changes = result;
+    return result;
+  }
+  function requireOperator(context: ExperimentalPluginRpcHandlerContext): void {
+    if (context.experimental_caller.kind === "plugin") throw new Error("Only the native operator may change Nudger settings or continuation preferences.");
+  }
+  function statusFor(threadId: string): ContinuationStatus {
+    return continuationStatus({ threadId, now: Date.now(), ownThread: peer.contains(threadId), recovery: recovery?.threadState(threadId) ?? null,
+      enabled: continuation?.enabled(threadId) ?? false, nudge: continuation?.latest(threadId) ?? null, nudgeCount: continuation?.sentCount(threadId) ?? 0 });
+  }
+  const fingerprint = ({ updatedAt: _updatedAt, ...status }: ContinuationStatus) => JSON.stringify(status);
+  function changed() {
+    cachedHistory = null;
+    if (signal.aborted || publishTimer) return;
+    publishTimer = setTimeout(() => {
+      publishTimer = undefined;
+      if (signal.aborted) return;
+      bb.realtime.publish("nudger-changed-v1", { version: 1 });
+      for (const [threadId, read] of bannerReads) {
+        if (Date.now() - read.at > 6 * 60 * 60_000) { bannerReads.delete(threadId); continue; }
+        const next = fingerprint(statusFor(threadId));
+        if (next !== read.fingerprint) { read.fingerprint = next; bb.realtime.publish("nudger-continuation-changed-v1", { threadId }); }
+      }
+    }, 1_000);
+    publishTimer.unref();
+  }
+  function history() {
+    if (!cachedHistory) {
+      const records = recovery?.records() ?? [];
+      cachedHistory = { records, version: historyVersion(records) };
+    }
+    return cachedHistory;
+  }
+  const jev = (key: string) => meteredDetector(createJevDetector({ apiKey: key }), "jev", usage);
+  /** The newest retained ending that was classified came from a removed Luna detector (legacy ids such as `*-codex-gpt-6-luna-*`). */
+  function lastClassifiedByLuna(): boolean {
+    let latest: { observedAt: number; detector: string } | null = null;
+    for (const record of history().records) if (record.detector && (!latest || record.observedAt > latest.observedAt)) latest = { observedAt: record.observedAt, detector: record.detector };
+    return latest?.detector.includes("-luna-") ?? false;
+  }
+  async function configure() {
+    const revision = settingsRevision;
+    const config = await settings.get();
+    if (revision !== settingsRevision) return;
+    signal.throwIfAborted();
+    const signature = JSON.stringify([config.enabled, config.detector ?? "none", config.typesafeApiKey ?? ""]);
+    if (configuredSignature === signature && configurationError === null) return;
+    operational = false;
+    continuation?.cancelAll("Nudger detector or enablement settings changed");
+    recovery?.configure(null);
+    configurationError = null;
+    try {
+      const migration = await bb.storage.kv.get<{ complete: boolean }>(MIGRATION_KEY);
+      if (!migration?.complete && await bb.storage.kv.get(LEGACY_ACTIVATION_KEY)) throw new Error("Legacy migration is incomplete; observation continues, but imported detector settings wait for pause and per-thread policy restoration.");
+      const imported = await bb.storage.kv.get<ImportedSettings>(LEGACY_SETTINGS_KEY);
+      if (revision !== settingsRevision) return;
+      if (config.detector === undefined && imported?.detector === "jev") {
+        throw new Error("Headquarters history and preferences are retained. To use Jev, enter your TypeSafe key in Nudger's secret setting and explicitly select Jev. The encrypted Headquarters credential remains unchanged; no paid detector is enabled by migration.");
+      }
+      // A stored "luna" value no longer matches the select options, so BB reads it as unset: the effective detector is none.
+      if (config.detector === undefined && (imported?.detector === "luna" || lastClassifiedByLuna())) throw new Error(LUNA_REMOVED);
+      if (config.enabled && config.detector === "jev") {
+        if (!config.typesafeApiKey) throw new Error("Enter the TypeSafe API key in Nudger settings before selecting Jev.");
+        recovery?.configure(jev(config.typesafeApiKey)); operational = true;
+      }
+    } catch (cause) { configurationError = cause instanceof Error ? cause.message : String(cause); }
+    if (revision !== settingsRevision) return;
+    configuredSignature = signature;
+    changed();
+  }
+  async function importLegacy(): Promise<boolean> {
+    if ((await bb.storage.kv.get<{ complete: boolean }>(MIGRATION_KEY))?.complete || !peer.present()) return false;
+    operational = false; configuredSignature = null;
+    continuation?.cancelAll("Legacy policy restoration in progress");
+    recovery?.configure(null);
+    try { return await migrateHeadquarters({ store: bb.storage.kv, settings, readPage: peer.readMigration, signal }); }
+    catch (cause) { if (!signal.aborted) bb.log.warn(`Nudger migration deferred: ${cause instanceof Error ? cause.message : String(cause)}`); return false; }
+  }
+  async function load() {
+    signal.throwIfAborted();
+    if (continuation) await continuation.dispose();
+    if (recovery) await recovery.dispose();
+    await usage.flush();
+    signal.throwIfAborted();
+    blockers.clear(); cachedHistory = null; configuredSignature = null; operational = false;
+    usage = createUsageLedger({ store: bb.storage.kv, warn: message => bb.log.warn(message) });
+    continuation = createContinuation({ bb, cursor: threadId => recovery?.cursor(threadId) ?? null,
+      paused: () => initializing || !operational || (recovery?.status().paused ?? true),
+      onChange: threadId => { if (!signal.aborted) bb.realtime.publish("nudger-continuation-changed-v1", { threadId }); } });
+    recovery = createRecoveryService({ bb, controlThreadIds: peer.currentControls, detector: null, continuation,
+      reportBlocker: async blocker => { blockers.set(blocker.threadId, blocker); changed(); }, onChange: changed });
+    await continuation.start();
+    await recovery.start();
+    signal.throwIfAborted();
+    await usage.backfill(recovery.records());
+    await configure();
+    bb.realtime.publish("nudger-continuation-changed-v1", { threadId: null });
+  }
+  async function ensureReady() {
+    signal.throwIfAborted();
+    if (!ready) ready = serial(async () => {
+      initializing = true;
+      try { await peer.refresh(); await importLegacy(); await load(); }
+      finally { initializing = false; }
+    }).catch(cause => { ready = null; throw cause; });
+    await ready;
+  }
+  async function configuration(): Promise<NudgerConfiguration> {
+    await ensureReady(); await changes;
+    const config = await settings.get();
+    return { version: 1 as const, enabled: config.enabled, detector: config.detector === "jev" ? "jev" : "none", keyConfigured: !!config.typesafeApiKey, paused: recovery!.status().paused, error: configurationError };
+  }
+  // Retained records keep only the final message's identity; its text is read once, from that exact event, and cached.
+  const recordedMessages = new Map<string, string | null>();
+  async function recordedMessage(record: { threadId: string; messageId: string; messageRevision: number }): Promise<string | null> {
+    const key = `${record.threadId}:${record.messageId}:${record.messageRevision}`;
+    if (recordedMessages.has(key)) return recordedMessages.get(key)!;
+    let text: string | null = null;
+    try {
+      const [row] = await bb.sdk.threads.events.list({ threadId: record.threadId, afterSeq: String(record.messageRevision - 1), order: "asc", limit: "1", types: ["item/completed"] });
+      if (row?.type === "item/completed" && row.seq === record.messageRevision && row.data.item.type === "agentMessage" && row.data.item.id === record.messageId) text = row.data.item.text;
+    } catch { return null; }
+    if (recordedMessages.size > 2000) recordedMessages.clear();
+    recordedMessages.set(key, text);
+    return text;
+  }
+  /**
+   * Obstacles that current public thread state still confirms. Ones captured by this runtime come first; after a
+   * restart, each thread's newest retained obstacle is rebuilt from its exact recorded final message and admitted
+   * through the same validation, so a reload never empties Needs your attention. Stale ones are dropped.
+   */
+  async function liveBlockers(): Promise<RecoveryBlocker[]> {
+    await peer.controls();
+    const latest = new Map<string, RecoveryRecord>();
+    for (const record of history().records) {
+      const known = latest.get(record.threadId);
+      if (!known || record.observedAt >= known.observedAt) latest.set(record.threadId, record);
+    }
+    for (const record of latest.values()) {
+      if (blockers.has(record.threadId) || record.action !== "reported") continue;
+      const kind = record.classification;
+      if (kind !== "blocker" && kind !== "permission" && kind !== "uncertainty") continue;
+      const text = await recordedMessage(record);
+      if (!text) continue;
+      blockers.set(record.threadId, { recordId: record.id, threadId: record.threadId, projectId: record.projectId, runId: record.runId,
+        messageId: record.messageId, messageRevision: record.messageRevision, kind, finalAssistantMessage: text, observedAt: record.observedAt });
+    }
+    const live: RecoveryBlocker[] = [];
+    for (const [threadId, blocker] of blockers) {
+      try {
+        if (!await recovery!.validateBlocker(blocker)) { blockers.delete(threadId); continue; }
+        live.push({ ...blocker, finalAssistantMessage: blocker.finalAssistantMessage.slice(0, 24576) });
+      } catch { blockers.delete(threadId); }
+    }
+    return live;
+  }
+  async function snapshot() {
+    await ensureReady();
+    const live = await liveBlockers();
+    const retained = history();
+    const status = recovery!.status();
+    if (configurationError) status.gates.push(configurationError);
+    const threads = boundedRows(status.threads, 512 * 1024, 20000);
+    const projects = boundedRows(status.projects, 128 * 1024, 20000);
+    if (threads.length !== status.threads.length || projects.length !== status.projects.length) status.gates.push("Public snapshot inventory exceeds its byte budget; watching still covers the complete native inventory.");
+    return snapshotSchema.parse({ version: 1, historyVersion: retained.version, status: { ...status, threads, projects },
+      records: boundedRows([...retained.records].sort((a, b) => b.observedAt - a.observedAt).map(record => ({ ...record, reason: record.reason.slice(0, 8192) }))),
+      jevUsage: await usage.history("jev"), blockers: boundedRows(live, 256 * 1024) });
+  }
+  async function stats() {
+    await ensureReady();
+    const live = await liveBlockers();
+    return computeStats({ records: history().records, jevUsage: await usage.history("jev"), status: recovery!.status(), liveBlockers: live, now: Date.now() });
+  }
+  function banner(threadId: string) {
+    const status = statusFor(threadId);
+    bannerReads.set(threadId, { at: Date.now(), fingerprint: fingerprint(status) });
+    return status;
+  }
+  bb.experimental_hooks.on("message.dispatch", async context => {
+    const owned = context.experimental_submission?.pluginId === bb.pluginId || context.queuedMessages.some(row => row.originPluginId === bb.pluginId);
+    if (owned) {
+      const controls = await peer.currentControls();
+      if (controls.includes(context.thread.id) || peer.contains(context.thread.id)) {
+        continuation?.cancel(context.thread.id, "Thread became a Headquarters control conversation");
+        return { action: "reject", message: nudgeRejectMessage("thread is a control conversation") };
+      }
+      if (peer.controlsPending()) return { action: "reject", message: nudgeRejectMessage("Headquarters control identities are being refreshed") };
+      if (!continuation || initializing) return { action: "reject", message: nudgeRejectMessage("continuation state is loading") };
+    }
+    const decision = continuation?.decide(context) ?? (owned
+      ? { action: "reject" as const, message: nudgeRejectMessage("unrecognized continuation submission") }
+      : { action: "proceed" as const });
+    if (decision.action === "proceed" && context.initiator === "user" && context.senderThreadId === null && context.experimental_submission === null) recovery?.rearm(context.thread.id, Date.now());
+    return decision;
+  });
+  bb.rpc.register(rpcContract, {
+    nudger_snapshot_v1: snapshot,
+    nudger_history_v1: async ({ cursor }) => { await ensureReady(); return historyPage(history().records, cursor); },
+    async nudger_pause_v1({ paused }, context) {
+      if (context.experimental_caller.kind === "plugin" && context.experimental_caller.pluginId !== "orchestrator") throw new Error("Only Headquarters may forward a plugin pause request.");
+      await ensureReady();
+      return serial(async () => {
+        await recovery!.setPaused(paused);
+        if (paused) continuation!.cancelAll(CANCEL_REASON.paused);
+        return { version: 1 as const, paused: recovery!.status().paused };
+      });
+    },
+    nudger_continuation_status_v1: async ({ threadId }) => { await ensureReady(); await peer.currentControls(); return banner(threadId); },
+    nudger_continuation_cancel_v1: async ({ threadId }, context) => {
+      requireOperator(context);
+      await ensureReady();
+      return serial(async () => { continuation!.cancel(threadId, CANCEL_REASON.countdown); await continuation!.flush(); return banner(threadId); });
+    },
+    nudger_continuation_toggle_v1: async ({ threadId, enabled }, context) => {
+      requireOperator(context);
+      await ensureReady();
+      return serial(async () => { await bb.sdk.threads.get({ threadId }); await continuation!.setEnabled(threadId, enabled); return banner(threadId); });
+    },
+    nudger_settings_v1: configuration,
+    async nudger_settings_set_v1({ version: _version, ...values }, context) {
+      requireOperator(context);
+      await ensureReady();
+      await serial(async () => { await settings.experimental_set(values); await configure(); });
+      return configuration();
+    },
+    nudger_stats_v1: stats,
+  }, { experimental_discoverable: true });
+  const verifier = createRecoveryVerifier({ readShadowComparison: async () => await retainedValue<ShadowComparison>(bb.storage.kv, "detector/synthetic-shadow") ?? null,
+    selectedDetectorId: async () => recovery?.status().detectorId ?? null });
+  bb.cli.register({ name: "nudger", summary: "Inspect guarded continuation; synthetic validation is explicit and never dispatches project work.", commands: [
+    { name: "status", summary: "Read passive inventory, gates and current recovery history.", usage: "bb nudger status" },
+    { name: "continuation", summary: "Read counts and continuation state, or toggle one existing thread.", usage: "bb nudger continuation [<threadId> [on|off]]" },
+    { name: "verify", summary: "Validate the stored synthetic Jev validation without a model call.", usage: "bb nudger verify" },
+    { name: "shadow", summary: "Explicitly run Jev against the bundled synthetic corpus (paid calls).", usage: "bb nudger shadow --confirm-paid-synthetic" },
+  ], async run(args, context) {
+    if (args[0] === "status" && args.length === 1) return { exitCode: 0, stdout: JSON.stringify(await snapshot(), null, 2) };
+    if (args[0] === "continuation" && args.length <= 3) {
+      await ensureReady();
+      if (args.length === 1) return { exitCode: 0, stdout: JSON.stringify({ paused: recovery!.status().paused, ...continuation!.snapshot() }, null, 2) };
+      const threadId = args[1]!.trim(); await bb.sdk.threads.get({ threadId });
+      if (args.length === 3) {
+        if (args[2] !== "on" && args[2] !== "off") return { exitCode: 1, stderr: "Usage: bb nudger continuation [<threadId> [on|off]]" };
+        await serial(() => continuation!.setEnabled(threadId, args[2] === "on"));
+      }
+      return { exitCode: 0, stdout: JSON.stringify({ threadId, enabled: continuation!.enabled(threadId), status: statusFor(threadId), ...continuation!.snapshot(threadId) }, null, 2) };
+    }
+    if (args[0] === "verify" && args.length === 1) { await ensureReady(); return { exitCode: 0, stdout: JSON.stringify(await verifier.validateDetectorComparison(recovery!.status().detectorId ?? "", { signal: context.signal }), null, 2) }; }
+    if (args[0] === "shadow" && args.length === 2 && args[1] === "--confirm-paid-synthetic") {
+      await ensureReady();
+      return serial(async () => {
+        const config = await settings.get();
+        if (!config.typesafeApiKey) return { exitCode: 1, stderr: "Configure the TypeSafe secret in Nudger settings. No fallback model is used." };
+        const comparison = await runShadowComparison({ detectors: [jev(config.typesafeApiKey)], signal: context.signal ? AbortSignal.any([signal, context.signal]) : signal });
+        await bb.storage.kv.set("detector/synthetic-shadow", comparison); await usage.flush(); changed();
+        return { exitCode: comparison.summaries.some(summary => summary.failures) ? 1 : 0, stdout: JSON.stringify(comparison, null, 2) };
+      });
+    }
+    return { exitCode: !args.length || args.length === 1 && ["--help", "-h"].includes(args[0]!) ? 0 : 1, stdout: "Usage: bb nudger <status|continuation [<threadId> [on|off]]|verify|shadow --confirm-paid-synthetic>" };
+  } });
+  settings.onChange(() => {
+    settingsRevision++;
+    // Native BB writes are already effective when this fires, outside the plugin queue.
+    // Revoke the old detector immediately, and fence configure() awaits by revision.
+    configuredSignature = null; operational = false;
+    continuation?.cancelAll("Nudger detector or enablement settings changed");
+    recovery?.configure(null);
+    if (!signal.aborted && recovery) void serial(configure).catch(cause => { if (!signal.aborted) bb.log.warn(`Nudger settings refresh failed: ${String(cause)}`); });
+  });
+  async function close() {
+    lifetime.abort(); clearTimeout(publishTimer);
+    if (!closing) closing = (async () => {
+      operational = false; await changes.catch(() => undefined);
+      await continuation?.dispose(); await recovery?.dispose(); await usage.flush(); blockers.clear();
+    })();
+    await closing;
+  }
+  bb.onDispose(close);
+  bb.background.service("nudger-watcher-v1", { async start(serviceSignal) {
+    const stop = () => lifetime.abort();
+    if (serviceSignal.aborted) stop(); else serviceSignal.addEventListener("abort", stop, { once: true });
+    try {
+      await ensureReady();
+      for await (const _tick of every(30_000, undefined, { signal, ref: false })) await serial(async () => {
+        await peer.refresh();
+        initializing = true;
+        try { if (await importLegacy()) await load(); }
+        finally { initializing = false; }
+        await configure(); await recovery!.refresh();
+      });
+    } catch (cause) { if (!signal.aborted) { bb.log.error(`Nudger watcher stopped: ${cause instanceof Error ? cause.message : String(cause)}`); throw cause; } }
+    finally { serviceSignal.removeEventListener("abort", stop); await close(); }
+  } });
+}
