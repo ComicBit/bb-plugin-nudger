@@ -221,6 +221,25 @@ test("a retained obstacle judged before the ending question is re-judged once af
   assert.equal(fetch.mock.callCount(), 2); assert.equal(h.controls.sends, 0);
 });
 
+test("a retained obstacle published before it could be re-judged is still re-judged on a later read", async t => {
+  const answers = [jevResponse("blocker", null), jevResponse("blocker", "operator_chosen")];
+  const fetch = t.mock.method(globalThis, "fetch", async () => answers.shift() ?? jevResponse("blocker"));
+  const h = fixture({ settings: { detector: "jev", typesafeApiKey: "offline-key" } });
+  let current = h.harness; t.after(() => current.dispose());
+  await h.snapshot(); await h.finish("Understood: the arcade is frozen. I won't restore or request the credential.");
+  await h.until(value => value.blockers.length === 1);
+  const replacement = await current.reload(plugin); current = replacement.harness;
+  const read = async () => snapshotSchema.parse(await current.callRpc("nudger_snapshot_v1", { version: 1 }));
+  // Paused: the retained obstacle is published with its old judgment, and no model is asked.
+  await current.callRpc("nudger_pause_v1", { version: 1, paused: true });
+  assert.equal((await read()).blockers.length, 1);
+  assert.equal(fetch.mock.callCount(), 1);
+  // Once resumed, the next read re-judges that same published ending, and it settles.
+  await current.callRpc("nudger_pause_v1", { version: 1, paused: false });
+  assert.deepEqual((await read()).blockers, []);
+  assert.equal(fetch.mock.callCount(), 2); assert.equal(h.controls.sends, 0);
+});
+
 test("factory loading rejects owned submissions, while an unavailable legacy key keeps classification gated", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("Missing key must never call a model"); });
   const h = fixture({ headquarters: true, migration: { version: 1, entries: [], settings: { detector: "jev" }, nextCursor: null } }); t.after(() => h.harness.dispose());

@@ -198,6 +198,8 @@ export default function plugin(bb: BbPluginApi) {
   const REJUDGE_PER_READ = 5;
   let rejudgeBudget = 25;
   const rejudged = new Set<string>();
+  /** Records this read path rebuilt from history (not live reports); only these may still be owed a re-judgment. */
+  const restored = new Set<string>();
   async function rejudgeRetained(record: RecoveryRecord, text: string): Promise<RecoveryRecord> {
     if (rejudgeBudget <= 0 || !operational || recovery!.status().paused) return record;
     // Claimed before any await, so concurrent snapshot and stats reads never judge the same ending twice.
@@ -226,17 +228,22 @@ export default function plugin(bb: BbPluginApi) {
     }
     let rejudgesLeft = REJUDGE_PER_READ;
     for (const retained of latest.values()) {
-      if (blockers.has(retained.threadId) || retained.action !== "reported") continue;
+      if (retained.action !== "reported") continue;
       if (retained.classification !== "blocker" && retained.classification !== "permission" && retained.classification !== "uncertainty") continue;
+      const stale = !retained.judgment?.questions?.ending && !rejudged.has(retained.id);
+      // A published thread keeps its blocker, unless it is this same restored ending still owed its re-judgment
+      // (published by a read that ran out of re-judge budget, or while paused). Live reports are never re-judged.
+      const shown = blockers.get(retained.threadId);
+      if (shown && !(stale && shown.recordId === retained.id && restored.has(retained.id))) continue;
       const text = await recordedMessage(retained);
       if (!text) continue;
-      const stale = !retained.judgment?.questions?.ending && !rejudged.has(retained.id);
       const record = stale && rejudgesLeft-- > 0 ? await rejudgeRetained(retained, text) : retained;
       const kind = record.classification;
       // Another read or a live report may have published this thread while the judgment was awaited.
       const published = blockers.get(record.threadId);
       if (published && published.recordId !== record.id) continue;
       if (record.action !== "reported" || (kind !== "blocker" && kind !== "permission" && kind !== "uncertainty")) { if (published) blockers.delete(record.threadId); continue; }
+      restored.add(record.id);
       blockers.set(record.threadId, { recordId: record.id, threadId: record.threadId, projectId: record.projectId, runId: record.runId,
         messageId: record.messageId, messageRevision: record.messageRevision, kind, finalAssistantMessage: text, observedAt: record.observedAt,
         ...jevBlockerFacts(record.judgment?.questions ?? null) });
