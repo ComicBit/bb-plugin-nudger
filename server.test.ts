@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk";
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.js";
-import { snapshotSchema, type MigrationPage, type NudgerSnapshot } from "./nudger-contract.js";
+import { decisionSchema, decisionsSchema, labelSchema, snapshotSchema, type MigrationPage, type NudgerSnapshot } from "./nudger-contract.js";
+// Headquarters' own copy of the v1 protocol: an old reader that has never heard of the decision log.
+import { historySchema as headquartersHistorySchema, snapshotSchema as headquartersSnapshotSchema } from "../nudger-contract.js";
 import type { ThreadEventRow } from "./recovery-contract.js";
 import { LEGACY_ACTIVATION_KEY, LEGACY_DATA_PREFIX, LEGACY_SETTINGS_KEY } from "./migration-storage.js";
 import { configurationSchema } from "./rpc-contract.js";
@@ -502,4 +507,37 @@ test("a fresh operator message durably overrides an imported Stop without modify
   assert.equal(await replacement.bb.storage.kv.get("recovery.stopped.worker"), false);
   assert.equal(await replacement.bb.storage.kv.get(`${LEGACY_DATA_PREFIX}recovery.stopped.worker`), true);
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("the decision log pages over RPC and exports JSONL with labels, while v1 snapshot and history keep their shape for Headquarters", async t => {
+  t.mock.method(globalThis, "fetch", async () => jevResponse("finished"));
+  const h = fixture({ settings: { detector: "jev", typesafeApiKey: "offline-key" } }); t.after(() => h.harness.dispose());
+  await h.snapshot(); await h.finish("All done; nothing left to do.");
+  await h.until(value => value.records[0]?.action === "finished");
+  const history = await h.harness.callRpc("nudger_history_v1", { version: 1 });
+  assert.equal(headquartersHistorySchema.parse(history).records.length, 1);
+  assert.equal(headquartersSnapshotSchema.parse(await h.harness.callRpc("nudger_snapshot_v1", { version: 1 })).records.length, 1);
+  // v1 rows carry no decision-log fields, so an outcome or label never changes the history Headquarters re-reads.
+  assert.doesNotMatch(JSON.stringify(history), /"gate"|"outcome"|"label"/);
+
+  const [decision] = decisionsSchema.parse(await h.harness.callRpc("nudger_decisions_v1", { version: 1 })).decisions;
+  assert.equal(decision!.text, "All done; nothing left to do."); assert.equal(decision!.gate, "finished");
+  assert.equal(decision!.judgment?.questions?.boundary?.choice, "finished");
+  const foreign = { experimental_caller: { kind: "plugin" as const, pluginId: "unrelated" } };
+  await assert.rejects(h.harness.callRpc("nudger_decisions_v1", { version: 1 }, foreign), /native clients and Headquarters/);
+  await assert.rejects(h.harness.callRpc("nudger_label_v1", { version: 1, recordId: decision!.id, label: "wrong", by: "x" }, foreign), /native clients and Headquarters/);
+  const labelled = labelSchema.parse(await h.harness.callRpc("nudger_label_v1", { version: 1, recordId: decision!.id, label: "wrong", note: "it had not finished", by: "fixture-reviewer" }));
+  assert.deepEqual({ by: labelled.decision.label?.by, note: labelled.decision.label?.note }, { by: "fixture-reviewer", note: "it had not finished" });
+
+  const dir = await mkdtemp(join(tmpdir(), "nudger-decisions-")); t.after(() => rm(dir, { recursive: true, force: true }));
+  const exported = await h.harness.runCli(["decisions", "--out", "decisions.jsonl", "--since", "2026-01-01"], { cwd: dir });
+  assert.equal(exported.exitCode, 0);
+  assert.deepEqual(JSON.parse(exported.stdout).decisions, 1); assert.equal(JSON.parse(exported.stdout).labelled, 1);
+  const lines = (await readFile(join(dir, "decisions.jsonl"), "utf8")).trimEnd().split("\n").map(line => decisionSchema.parse(JSON.parse(line)));
+  assert.deepEqual(lines.map(line => [line.id, line.label?.label, line.text]), [[decision!.id, "wrong", "All done; nothing left to do."]]);
+  assert.equal((await h.harness.runCli(["decisions", "--since", "not a date"])).exitCode, 1);
+
+  assert.equal((await h.harness.runCli(["label", decision!.id, "clear"])).exitCode, 0);
+  assert.equal(decisionsSchema.parse(await h.harness.callRpc("nudger_decisions_v1", { version: 1 })).decisions[0]!.label, null);
+  assert.equal(h.controls.sends, 0);
 });

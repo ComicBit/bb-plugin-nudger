@@ -13,9 +13,10 @@ export const judgmentSchema = z.object({
   confidence: z.number().nullable(), probabilities: probabilities.nullable(),
   questions: z.record(z.string().max(200), z.object({ choice: z.string().max(200), confidence: z.number(), probabilities })).refine(value => Object.keys(value).length <= 32).nullable(),
 });
+const action = z.enum(["observed", "finished", "reported", "suppressed", "nudged", "discarded", "error"]);
 export const recordSchema = z.object({
   id, threadId: id, projectId: id, runId: id, messageId: id, messageRevision: count, observedAt: timestamp,
-  classification: classification.nullable(), action: z.enum(["observed", "finished", "reported", "suppressed", "nudged", "discarded", "error"]),
+  classification: classification.nullable(), action,
   reason: text, detector: z.string().max(200).nullable(), judgment: judgmentSchema.nullable(),
 });
 export const blockerSchema = z.object({
@@ -38,6 +39,20 @@ export const pauseSchema = z.object({ version: z.literal(1), paused: z.boolean()
 export const versionSchema = z.object({ version: z.literal(1) });
 export const historyRequestSchema = z.object({ version: z.literal(1), cursor: id.nullable().default(null) });
 export const historySchema = z.object({ version: z.literal(1), records: z.array(recordSchema).max(200), nextCursor: id.nullable() });
+/** Decision log (30 days, every action): the record plus why it was decided and what followed. Additive; v1 history is unchanged. */
+const gate = z.string().max(100);
+export const decisionLabelSchema = z.object({ label: z.literal("wrong"), note: z.string().max(2000).nullable(), by: z.string().min(1).max(200), at: timestamp });
+export const decisionSchema = recordSchema.extend({
+  gate: gate.nullable(), text: z.string().max(24576).nullable(), textTruncated: z.boolean(),
+  nudge: z.object({ nudgeId: id, text, scheduledAt: timestamp, sendAt: timestamp, state: z.enum(["pending", "cancelled", "sent", "withheld"]), gate: gate.nullable(), reason: text.nullable() }).nullable(),
+  outcome: z.object({ kind: z.enum(["next-ending", "stopped", "cancelled", "none"]), at: timestamp, nextRecordId: id.nullable(), classification: classification.nullable(), action: action.nullable(), reason: text.nullable() }).nullable(),
+  label: decisionLabelSchema.nullable(),
+});
+const decisionCursor = z.string().min(1).max(4200);
+export const decisionsRequestSchema = z.object({ version: z.literal(1), cursor: decisionCursor.nullable().default(null), since: timestamp.optional() });
+export const decisionsSchema = z.object({ version: z.literal(1), decisions: z.array(decisionSchema).max(200), nextCursor: decisionCursor.nullable() });
+export const labelRequestSchema = z.object({ version: z.literal(1), recordId: id, label: z.literal("wrong").nullable(), note: z.string().max(2000).optional(), by: z.string().min(1).max(200) });
+export const labelSchema = z.object({ version: z.literal(1), decision: decisionSchema });
 export const migrationKeySchema = z.string().max(4096).regex(/^(?:continuation\.(?:off\.|nudge\.|log$|sentCounts$)|recovery\.(?:records\.|stopped\.|rearmed\.|paused$)|usage\.detector\.|detector\/synthetic-shadow$)/);
 // Headquarters' export still carries its former detector choices ("luna", hostId); Nudger keeps them readable but never acts on them.
 export const migrationSettingsSchema = z.object({ detector: z.enum(["none", "luna", "jev"]).optional(), typesafeApiKey: z.string().max(8192).optional(), hostId: z.string().max(4096).optional() });
@@ -52,3 +67,4 @@ export type NudgerRecord = NudgerSnapshot["records"][number];
 export type NudgerStatus = NudgerSnapshot["status"];
 export type NudgerBlocker = NudgerSnapshot["blockers"][number];
 export type NudgerUsageHistory = NonNullable<NudgerSnapshot["jevUsage"]>;
+export type NudgerDecision = z.infer<typeof decisionSchema>;

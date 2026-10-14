@@ -28,6 +28,8 @@ export interface FinalMessageClassifier {
   classify(finalAssistantMessage: string, options?: { signal?: AbortSignal }): Promise<FinalMessageJudgment>;
 }
 
+export type RecoveryAction = "observed" | "finished" | "reported" | "suppressed" | "nudged" | "discarded" | "error";
+
 export interface RecoveryRecord {
   id: string;
   threadId: string;
@@ -37,10 +39,76 @@ export interface RecoveryRecord {
   messageRevision: number;
   observedAt: number;
   classification: RecoveryClassification | null;
-  action: "observed" | "finished" | "reported" | "suppressed" | "nudged" | "discarded" | "error";
+  action: RecoveryAction;
   reason: string;
   detector: string | null;
   judgment: FinalMessageJudgment | null;
+  // Decision log (absent on records kept from before it existed). Not part of the v1 history view.
+  /** Stable id of the gate that decided `action`; `reason` is its human wording. */
+  gate?: string;
+  /** The judged final message, stored compressed beside the record until the record leaves the decision log. */
+  text?: RecoveryTextRef;
+  /** The nudge scheduled for this ending and what became of it. */
+  nudge?: RecoveryNudgeDecision;
+  /** What the thread did next; settled once, lazily. */
+  outcome?: RecoveryOutcome;
+  /** An operator's verdict on this decision. */
+  label?: RecoveryLabel;
+}
+
+export interface RecoveryTextRef {
+  chars: number;
+  /** Stored (compressed) bytes, for the storage budget. */
+  bytes: number;
+  /** The message was longer than the stored cap. */
+  truncated: boolean;
+}
+
+export interface RecoveryNudgeDecision {
+  nudgeId: string;
+  /** The exact text dispatched (or that would have been). */
+  text: string;
+  scheduledAt: number;
+  sendAt: number;
+  state: "pending" | "cancelled" | "sent" | "withheld";
+  /** Stable id of the send-time gate that cancelled or withheld it; null while pending and once sent. */
+  gate: string | null;
+  reason: string | null;
+}
+
+/** What followed a decision within the outcome window: the thread's next ending, the operator's Stop or cancel, or nothing. */
+export interface RecoveryOutcome {
+  kind: "next-ending" | "stopped" | "cancelled" | "none";
+  at: number;
+  /** `next-ending`: the following ending's record, and its classification/action as they settle. */
+  nextRecordId: string | null;
+  classification: RecoveryClassification | null;
+  action: RecoveryAction | null;
+  /** `stopped`/`cancelled`: the internal reason. */
+  reason: string | null;
+}
+
+export interface RecoveryLabel {
+  label: "wrong";
+  note: string | null;
+  /** Operator-supplied attribution for the label. */
+  by: string;
+  at: number;
+}
+
+/** One decision as exported: the record with its judged text and every decision field explicit. */
+export interface RecoveryDecision extends Omit<RecoveryRecord, "gate" | "text" | "nudge" | "outcome" | "label"> {
+  gate: string | null;
+  text: string | null;
+  textTruncated: boolean;
+  nudge: RecoveryNudgeDecision | null;
+  outcome: RecoveryOutcome | null;
+  label: RecoveryLabel | null;
+}
+
+export interface RecoveryDecisionPage {
+  decisions: RecoveryDecision[];
+  nextCursor: string | null;
 }
 
 export interface RecoveryBlocker {
@@ -142,6 +210,13 @@ export interface RecoveryService {
    * an earlier manual Stop no longer suppresses that thread's later endings. Stops after `at` still apply.
    */
   rearm(threadId: string, at: number): void;
+  /** The v1 history view: the records Headquarters and stats read (see historyRecordIds), without decision-log fields. */
   records(): RecoveryRecord[];
+  /** One page of the decision log, oldest first: after `cursor`, observed at or after `since`. */
+  decisions(request: { cursor: string | null; since?: number }): Promise<RecoveryDecisionPage>;
+  /** Sets, or clears with null, the label on a retained decision; resolves the decision, or null when it is gone. */
+  label(recordId: string, label: RecoveryLabel | null): Promise<RecoveryDecision | null>;
+  /** Mirrors the thread's latest nudge onto the decision it was scheduled for (wired to continuation changes). */
+  noteNudge(threadId: string): void;
   dispose(): Promise<void>;
 }

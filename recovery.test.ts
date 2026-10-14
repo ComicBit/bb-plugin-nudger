@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RECOVERY_NUDGE, type FinalMessageClassifier, type FinalMessageJudgment, type RecoveryBlocker, type RecoveryRecord, type RecoveryService, type ThreadEventRow } from "./recovery-contract.js";
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { createRecoveryService, retainedRecordIds } from "./recovery.js";
+import { createRecoveryService } from "./recovery.js";
+import { DECISION_LIMITS, historyRecordIds, OUTCOME_WINDOW_MS } from "./decision-log.js";
 import { createContinuation, SCHEDULED_REASON, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, HELD_REASON, WITHHELD_REASON } from "./continuation-copy.js";
 import { WORKFLOW_SETTLE_MS } from "./workflow-steps.js";
@@ -82,7 +83,7 @@ function fixture(count = 1, classify: FinalMessageClassifier["classify"] = async
   } });
   let service: RecoveryService;
   const continuationSends: Array<Record<string, unknown>> = [];
-  const continuation: Continuation | null = withContinuation ? createContinuation({ bb, cursor: threadId => service.cursor(threadId) }) : null;
+  const continuation: Continuation | null = withContinuation ? createContinuation({ bb, cursor: threadId => service.cursor(threadId), onChange: threadId => service.noteNudge(threadId) }) : null;
   service = createRecoveryService({ bb, controlThreadIds: emptyControls,
     detector: { id: "fixture", classify: async (text, options) => { classified.push(text); signals.push(options?.signal); return classify(text, options); } },
     reportBlocker: async blocker => { reports.push(blocker); },
@@ -804,42 +805,177 @@ function stored(id: string, threadId: string, daysAgo: number, now: number, over
   return { id, threadId, projectId: "project", runId: id, messageId: `message-${id}`, messageRevision: 1, observedAt: now - daysAgo * 86_400_000,
     classification: null, action: "finished", reason: "fixture", detector: null, judgment: null, ...overrides };
 }
-/** Kept: the oldest (coverage anchor), a nudge inside the daily history, the detector's newest outcome, each thread's latest, the last week. */
+const ACTIONS: RecoveryRecord["action"][] = ["observed", "finished", "reported", "suppressed", "nudged", "discarded", "error"];
+/**
+ * The v1 history view: the oldest (coverage anchor), a nudge inside the daily history, the detector's newest outcome,
+ * each thread's latest, the last week. The decision log adds every other record of the last 30 days.
+ */
 function retentionCorpus(now: number) {
-  const kept = [
+  const history = [
     stored("anchor", "thread-a", 200, now),
     stored("nudge-100d", "thread-a", 100, now, { action: "nudged", classification: "continue" }),
     stored("outcome-20d", "thread-a", 20, now, { detector: "jev-a", classification: "finished", judgment: judgment("finished") }),
     stored("recent-1d", "thread-a", 1, now),
     stored("only-50d", "thread-b", 50, now, { action: "suppressed" }),
   ];
+  const logOnly = [
+    stored("plain-10d", "thread-a", 10, now, { action: "suppressed" }),
+    stored("outcome-29d", "thread-a", 29, now, { detector: "jev-a", classification: "finished", judgment: judgment("finished") }),
+  ];
   const dropped = [
     stored("nudge-190d", "thread-a", 190, now, { action: "nudged", classification: "continue" }),
-    stored("outcome-30d", "thread-a", 30, now, { detector: "jev-a", classification: "finished", judgment: judgment("finished") }),
-    stored("plain-10d", "thread-a", 10, now, { action: "suppressed" }),
+    stored("outcome-31d", "thread-a", 31, now, { detector: "jev-a", classification: "finished", judgment: judgment("finished") }),
+    stored("plain-40d", "thread-a", 40, now, { action: "suppressed" }),
   ];
-  return { kept, dropped };
+  return { history, logOnly, dropped };
 }
 
-test("retention keeps what the dashboard and recovery read and nothing else", () => {
+test("the v1 history view keeps what the dashboard and recovery read and nothing else", () => {
   const now = Date.now();
-  const { kept, dropped } = retentionCorpus(now);
-  assert.deepEqual([...retainedRecordIds([...dropped, ...kept], now)].sort(), kept.map(record => record.id).sort());
+  const { history, logOnly, dropped } = retentionCorpus(now);
+  assert.deepEqual([...historyRecordIds([...dropped, ...logOnly, ...history], now)].sort(), history.map(record => record.id).sort());
 });
 
-test("startup prunes records past retention from storage, and a restart restores exactly the retained ones", async t => {
+test("startup prunes records past both the decision log and the history view, and a restart restores exactly the retained ones", async t => {
   const h = fixture(); t.after(() => h.service.dispose());
-  const { kept, dropped } = retentionCorpus(Date.now());
-  for (const record of [...kept, ...dropped]) await h.bb.storage.kv.set(`recovery.records.${record.id}`, record);
+  const { history, logOnly, dropped } = retentionCorpus(Date.now());
+  for (const record of [...history, ...logOnly, ...dropped]) await h.bb.storage.kv.set(`recovery.records.${record.id}`, record);
   await h.service.start();
-  const keptIds = kept.map(record => record.id).sort();
-  assert.deepEqual(h.service.records().map(record => record.id).sort(), keptIds);
-  assert.deepEqual((await h.bb.storage.kv.list("recovery.records.")).sort(), keptIds.map(id => `recovery.records.${id}`).sort());
+  const historyIds = history.map(record => record.id).sort();
+  const storedIds = [...history, ...logOnly].map(record => record.id).sort();
+  assert.deepEqual(h.service.records().map(record => record.id).sort(), historyIds);
+  assert.deepEqual((await h.service.decisions({ cursor: null })).decisions.map(decision => decision.id).sort(), storedIds);
+  assert.deepEqual((await h.bb.storage.kv.list("recovery.records.")).sort(), storedIds.map(id => `recovery.records.${id}`).sort());
   await h.service.dispose();
   const restarted = createRecoveryService({ bb: h.bb, controlThreadIds: emptyControls, detector: null, reportBlocker: async () => undefined });
   t.after(() => restarted.dispose());
   await restarted.start();
   assert.deepEqual(restarted.records(), h.service.records());
+  assert.deepEqual((await restarted.decisions({ cursor: null })).decisions.map(decision => decision.id).sort(), storedIds);
+});
+
+test("every action's decision stays 30 days; past it only the history view's nudges remain", async t => {
+  const h = fixture(); t.after(() => h.service.dispose());
+  const now = Date.now();
+  const corpus = [stored("latest", "thread-a", 0, now), stored("anchor", "thread-a", 300, now),
+    ...ACTIONS.flatMap(action => [stored(`${action}-29d`, "thread-a", 29, now, { action }), stored(`${action}-31d`, "thread-a", 31, now, { action })])];
+  for (const record of corpus) await h.bb.storage.kv.set(`recovery.records.${record.id}`, record);
+  await h.service.start();
+  const kept = (await h.service.decisions({ cursor: null })).decisions;
+  // A prior process's pending ending is retained as suppressed, never replayed.
+  assert.deepEqual(kept.filter(decision => decision.id.endsWith("-29d")).map(decision => decision.id).sort(), ACTIONS.map(action => `${action}-29d`).sort());
+  assert.deepEqual(kept.filter(decision => decision.id.endsWith("-31d")).map(decision => decision.id), ["nudged-31d"]);
+  assert.deepEqual(h.service.records().map(record => record.id).sort(), ["anchor", "latest", "nudged-29d", "nudged-31d"]);
+});
+
+test("over a hard cap the oldest decisions go first, the history view's own last", async t => {
+  const h = fixture(); t.after(() => h.service.dispose());
+  const now = Date.now();
+  // Spread over 8–18 days ago, all past the history view's week: only the newest (thread latest) and the oldest (anchor) are its own.
+  const corpus = Array.from({ length: DECISION_LIMITS.count + 3 }, (_, index) => stored(`record-${String(index).padStart(5, "0")}`, "thread-a", 8 + index / 1000, now));
+  for (const record of corpus) await h.bb.storage.kv.set(`recovery.records.${record.id}`, record);
+  await h.service.start();
+  const ids = (await h.bb.storage.kv.list("recovery.records.")).map(key => key.slice("recovery.records.".length)).sort();
+  assert.equal(ids.length, DECISION_LIMITS.count);
+  const oldest = corpus.at(-1)!.id;
+  // The three dropped are the oldest ones the history view does not publish; its anchor stays.
+  assert.deepEqual(corpus.filter(record => !ids.includes(record.id)).map(record => record.id), corpus.slice(-4, -1).map(record => record.id));
+  assert.ok(ids.includes(oldest));
+});
+
+test("a live decision keeps its judged text, every question's answer, its gate and the next ending as its outcome", async t => {
+  const answered: FinalMessageJudgment = { ...judgment("finished"), questions: {
+    boundary: { choice: "finished", confidence: 0.9, probabilities: { continue: 0.1, finished: 0.9, uncertainty: 0 } },
+    obstacle: { choice: "none", confidence: 0.8, probabilities: { none: 0.8, blocker: 0.2, permission: 0, uncertainty: 0 } },
+  } };
+  const h = fixture(1, async () => answered); t.after(() => h.service.dispose());
+  await h.service.start();
+  const long = `Done. ${"x".repeat(30_000)}`;
+  await h.finish(0, long);
+  const first = await h.waitForRecord("thread-0", "finished");
+  let [decision] = (await h.service.decisions({ cursor: null })).decisions;
+  assert.equal(decision!.id, first.id);
+  assert.equal(decision!.text, long.slice(0, 24_576)); assert.equal(decision!.textTruncated, true);
+  assert.deepEqual(decision!.judgment?.questions, answered.questions);
+  assert.equal(decision!.gate, "finished"); assert.equal(decision!.outcome, null);
+  // The thread's next ending settles the first decision's outcome, with its classification once judged.
+  const thread = h.threads[0]!;
+  thread.status = "active"; thread.updatedAt++;
+  h.history.get(thread.id)!.push(turn(thread.id, "run-2", 10));
+  await h.harness.emitThreadEvent("thread.active", { thread });
+  h.history.get(thread.id)!.push(message(thread.id, "run-2", 11, "Second reply"), turn(thread.id, "run-2", 12, true));
+  thread.status = "idle"; thread.updatedAt++;
+  await h.harness.emitThreadEvent("thread.idle", { thread, lastAssistantText: null });
+  await h.until(() => h.service.records().filter(record => record.action === "finished").length === 2);
+  await h.service.refresh();
+  [decision] = (await h.service.decisions({ cursor: null })).decisions;
+  assert.deepEqual(decision!.outcome && { kind: decision!.outcome.kind, next: decision!.outcome.nextRecordId, classification: decision!.outcome.classification, action: decision!.outcome.action },
+    { kind: "next-ending", next: JSON.stringify([thread.id, "run-2"]), classification: "finished", action: "finished" });
+});
+
+test("a manual Stop within the window is the decision's outcome; a decision with nothing after 24 hours settles as none", async t => {
+  const h = fixture(2, async () => judgment("finished")); t.after(() => h.service.dispose());
+  // Records from before the decision log (no gate) never get an outcome; this one is a logged decision.
+  const old = stored("old", "thread-1", 0, Date.now() - OUTCOME_WINDOW_MS - 60_000, { gate: "finished" });
+  await h.bb.storage.kv.set(`recovery.records.${old.id}`, old);
+  await h.service.start();
+  await h.finish(0);
+  const ending = await h.waitForRecord("thread-0", "finished");
+  const thread = h.threads[0]!;
+  h.history.get(thread.id)!.push({ ...stop(thread.id, 20), createdAt: Date.now() });
+  thread.updatedAt++;
+  await h.harness.emitThreadEvent("experimental_thread.events", { thread, sequence: 20 });
+  const decisions = (await h.service.decisions({ cursor: null })).decisions;
+  const stopped = decisions.find(decision => decision.id === ending.id)!;
+  assert.equal(stopped.outcome?.kind, "stopped"); assert.equal(stopped.outcome?.reason, CANCEL_REASON.stop);
+  assert.deepEqual(decisions.find(decision => decision.id === "old")!.outcome, { kind: "none", at: old.observedAt + OUTCOME_WINDOW_MS, nextRecordId: null, classification: null, action: null, reason: null });
+});
+
+test("a nudge's text and fate are kept on its decision, and the operator cancelling it is the outcome", async t => {
+  const h = fixture(1, async () => judgment("continue"), true); t.after(() => h.service.dispose());
+  await h.continuation!.start();
+  await h.service.start();
+  await h.finish(0);
+  const nudged = await h.waitForRecord("thread-0", "nudged");
+  h.continuation!.cancel("thread-0", CANCEL_REASON.countdown);
+  await h.service.refresh();
+  const decision = (await h.service.decisions({ cursor: null })).decisions.find(row => row.id === nudged.id)!;
+  assert.equal(decision.gate, "nudge-scheduled");
+  assert.deepEqual(decision.nudge && { text: decision.nudge.text, state: decision.nudge.state, gate: decision.nudge.gate, reason: decision.nudge.reason },
+    { text: RECOVERY_NUDGE, state: "cancelled", gate: "operator-cancel", reason: CANCEL_REASON.countdown });
+  assert.equal(decision.outcome?.kind, "cancelled"); assert.equal(decision.outcome?.reason, CANCEL_REASON.countdown);
+  await h.continuation!.dispose();
+});
+
+test("a wrong label persists with its decision across restarts until cleared, and pages are stable and complete", async t => {
+  const h = fixture(); t.after(() => h.service.dispose());
+  const now = Date.now();
+  const corpus = Array.from({ length: 450 }, (_, index) => stored(`record-${index}`, "thread-a", index / 100, now));
+  for (const record of corpus) await h.bb.storage.kv.set(`recovery.records.${record.id}`, record);
+  await h.service.start();
+  const labelled = await h.service.label("record-7", { label: "wrong", note: "was still working", by: "fixture-reviewer", at: now });
+  assert.equal(labelled?.label?.by, "fixture-reviewer");
+  assert.equal(await h.service.label("missing", { label: "wrong", note: null, by: "fixture-reviewer", at: now }), null);
+  await h.service.dispose();
+  const restarted = createRecoveryService({ bb: h.bb, controlThreadIds: emptyControls, detector: null, reportBlocker: async () => undefined });
+  t.after(() => restarted.dispose());
+  await restarted.start();
+  const seen: string[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+  do {
+    const page = await restarted.decisions({ cursor });
+    seen.push(...page.decisions.map(decision => decision.id));
+    if (page.decisions.some(decision => decision.id === "record-7")) assert.deepEqual(page.decisions.find(decision => decision.id === "record-7")!.label, { label: "wrong", note: "was still working", by: "fixture-reviewer", at: now });
+    cursor = page.nextCursor; pages++;
+  } while (cursor !== null);
+  assert.equal(pages, 3);
+  // Oldest first, each once.
+  assert.deepEqual(seen, [...corpus].reverse().map(record => record.id));
+  const since = (await restarted.decisions({ cursor: null, since: now - 50_000_000 })).decisions;
+  assert.ok(since.length > 0 && since.every(decision => decision.observedAt >= now - 50_000_000));
+  await restarted.label("record-7", null);
+  assert.equal((await restarted.decisions({ cursor: null, since: corpus[7]!.observedAt })).decisions.find(decision => decision.id === "record-7")!.label, null);
 });
 
 test("an unchanged pause setting is not written again", async t => {

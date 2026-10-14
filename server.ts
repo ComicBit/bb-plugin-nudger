@@ -1,5 +1,8 @@
 import type { BbPluginApi, ExperimentalPluginRpcHandlerContext } from "@get-bb/plugin-sdk";
+import { mkdir, open } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { setInterval as every } from "node:timers/promises";
+import type { z } from "zod";
 import { createContinuation, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, nudgeRejectMessage } from "./continuation-copy.js";
 import { continuationStatus, type ContinuationStatus } from "./continuation-status.js";
@@ -13,11 +16,24 @@ import { migrateHeadquarters, MIGRATION_KEY } from "./migration.js";
 import { LEGACY_ACTIVATION_KEY, LEGACY_SETTINGS_KEY, retainedValue, type ImportedSettings } from "./migration-storage.js";
 import { boundedRows, historyPage, historyVersion } from "./publication.js";
 import { rpcContract } from "./rpc-contract.js";
-import { snapshotSchema } from "./nudger-contract.js";
+import { decisionSchema, labelRequestSchema, snapshotSchema } from "./nudger-contract.js";
 import { type NudgerConfiguration } from "./rpc-contract.js";
 import { computeStats } from "./stats.js";
 
 const LUNA_REMOVED = "Luna was removed; select Jev. Enter your TypeSafe key in Nudger settings, then select Jev. Until then Nudger only observes.";
+const DECISIONS_USAGE = "bb nudger decisions [--since <ISO date|epoch ms>] [--out <path>]";
+const LABEL_USAGE = "bb nudger label <recordId> <wrong|clear> [--by <name>] [--note <text>]";
+
+/** `--name value` pairs; null when any token is not one. */
+function cliFlags(tokens: readonly string[]): Record<string, string> | null {
+  const flags: Record<string, string> = {};
+  for (let index = 0; index < tokens.length; index += 2) {
+    const name = tokens[index]!, value = tokens[index + 1];
+    if (!name.startsWith("--") || value === undefined) return null;
+    flags[name.slice(2)] = value;
+  }
+  return flags;
+}
 
 /** Factory registration is synchronous and inert; only the passive background service loads native inventory. */
 export default function plugin(bb: BbPluginApi) {
@@ -136,7 +152,7 @@ export default function plugin(bb: BbPluginApi) {
     usage = createUsageLedger({ store: bb.storage.kv, warn: message => bb.log.warn(message) });
     continuation = createContinuation({ bb, cursor: threadId => recovery?.cursor(threadId) ?? null,
       paused: () => initializing || !operational || (recovery?.status().paused ?? true),
-      onChange: threadId => { if (!signal.aborted) bb.realtime.publish("nudger-continuation-changed-v1", { threadId }); } });
+      onChange: threadId => { recovery?.noteNudge(threadId); if (!signal.aborted) bb.realtime.publish("nudger-continuation-changed-v1", { threadId }); } });
     recovery = createRecoveryService({ bb, controlThreadIds: peer.currentControls, detector: null, continuation,
       reportBlocker: async blocker => { blockers.set(blocker.threadId, blocker); changed(); }, onChange: changed });
     await continuation.start();
@@ -244,6 +260,35 @@ export default function plugin(bb: BbPluginApi) {
     if (decision.action === "proceed" && context.initiator === "user" && context.senderThreadId === null && context.experimental_submission === null) recovery?.rearm(context.thread.id, Date.now());
     return decision;
   });
+  function requireNativeOrHeadquarters(context: ExperimentalPluginRpcHandlerContext): void {
+    if (context.experimental_caller.kind === "plugin" && context.experimental_caller.pluginId !== "orchestrator") throw new Error("Only native clients and Headquarters may read or label Nudger decisions.");
+  }
+  async function label({ recordId, label, note, by }: z.infer<typeof labelRequestSchema>) {
+    await ensureReady();
+    const decision = await recovery!.label(recordId, label === null ? null : { label, note: note ?? null, by, at: Date.now() });
+    if (!decision) throw new Error(`Nudger keeps no decision ${recordId}; decisions age out after 30 days.`);
+    return { version: 1 as const, decision: decisionSchema.parse(decision) };
+  }
+  /** Writes every retained decision (observed at or after `since`) to `path` as JSON Lines, oldest first. */
+  async function exportDecisions(path: string, since: number | undefined) {
+    await mkdir(dirname(path), { recursive: true });
+    const file = await open(path, "w");
+    let decisions = 0, bytes = 0, labelled = 0;
+    try {
+      let cursor: string | null = null;
+      do {
+        const page = await recovery!.decisions({ cursor, since });
+        if (page.decisions.length) {
+          const chunk = page.decisions.map(decision => `${JSON.stringify(decisionSchema.parse(decision))}\n`).join("");
+          await file.write(chunk);
+          decisions += page.decisions.length; bytes += Buffer.byteLength(chunk);
+          labelled += page.decisions.filter(decision => decision.label !== null).length;
+        }
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+    } finally { await file.close(); }
+    return { path, decisions, labelled, bytes };
+  }
   bb.rpc.register(rpcContract, {
     nudger_snapshot_v1: snapshot,
     nudger_history_v1: async ({ cursor }) => { await ensureReady(); return historyPage(history().records, cursor); },
@@ -275,12 +320,23 @@ export default function plugin(bb: BbPluginApi) {
       return configuration();
     },
     nudger_stats_v1: stats,
+    async nudger_decisions_v1({ cursor, since }, context) {
+      requireNativeOrHeadquarters(context);
+      await ensureReady();
+      return { version: 1 as const, ...await recovery!.decisions({ cursor, since }) };
+    },
+    async nudger_label_v1(request, context) {
+      requireNativeOrHeadquarters(context);
+      return label(request);
+    },
   }, { experimental_discoverable: true });
   const verifier = createRecoveryVerifier({ readShadowComparison: async () => await retainedValue<ShadowComparison>(bb.storage.kv, "detector/synthetic-shadow") ?? null,
     selectedDetectorId: async () => recovery?.status().detectorId ?? null });
   bb.cli.register({ name: "nudger", summary: "Inspect guarded continuation; synthetic validation is explicit and never dispatches project work.", commands: [
     { name: "status", summary: "Read passive inventory, gates and current recovery history.", usage: "bb nudger status" },
     { name: "continuation", summary: "Read counts and continuation state, or toggle one existing thread.", usage: "bb nudger continuation [<threadId> [on|off]]" },
+    { name: "decisions", summary: "Export the 30-day decision log as JSONL (read-only); prints the file path and counts.", usage: DECISIONS_USAGE },
+    { name: "label", summary: "Mark one decision wrong (or clear it); labelled decisions export as a test set.", usage: LABEL_USAGE },
     { name: "verify", summary: "Validate the stored synthetic Jev validation without a model call.", usage: "bb nudger verify" },
     { name: "shadow", summary: "Explicitly run Jev against the bundled synthetic corpus (paid calls).", usage: "bb nudger shadow --confirm-paid-synthetic" },
   ], async run(args, context) {
@@ -295,6 +351,24 @@ export default function plugin(bb: BbPluginApi) {
       }
       return { exitCode: 0, stdout: JSON.stringify({ threadId, enabled: continuation!.enabled(threadId), status: statusFor(threadId), ...continuation!.snapshot(threadId) }, null, 2) };
     }
+    if (args[0] === "decisions") {
+      const flags = cliFlags(args.slice(1));
+      const since = flags?.since === undefined ? undefined : /^\d+$/.test(flags.since) ? Number(flags.since) : Date.parse(flags.since);
+      if (!flags || Object.keys(flags).some(name => name !== "since" && name !== "out") || Number.isNaN(since)) return { exitCode: 1, stderr: `Usage: ${DECISIONS_USAGE}` };
+      await ensureReady();
+      const dataDir = bb.server.experimental_dataDir;
+      const path = flags.out !== undefined ? resolve(context.cwd ?? dataDir, flags.out)
+        : join(dataDir, "plugins", bb.pluginId, "exports", `decisions-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
+      return { exitCode: 0, stdout: JSON.stringify(await exportDecisions(path, since), null, 2) };
+    }
+    if (args[0] === "label" && args.length >= 3) {
+      const flags = cliFlags(args.slice(3));
+      const request = labelRequestSchema.safeParse({ version: 1, recordId: args[1], label: args[2] === "wrong" ? "wrong" : args[2] === "clear" ? null : undefined,
+        note: flags?.note, by: flags?.by ?? "operator" });
+      if (!flags || Object.keys(flags).some(name => name !== "by" && name !== "note") || !request.success) return { exitCode: 1, stderr: `Usage: ${LABEL_USAGE}` };
+      const { decision } = await label(request.data);
+      return { exitCode: 0, stdout: JSON.stringify({ recordId: decision.id, label: decision.label }, null, 2) };
+    }
     if (args[0] === "verify" && args.length === 1) { await ensureReady(); return { exitCode: 0, stdout: JSON.stringify(await verifier.validateDetectorComparison(recovery!.status().detectorId ?? "", { signal: context.signal }), null, 2) }; }
     if (args[0] === "shadow" && args.length === 2 && args[1] === "--confirm-paid-synthetic") {
       await ensureReady();
@@ -306,7 +380,7 @@ export default function plugin(bb: BbPluginApi) {
         return { exitCode: comparison.summaries.some(summary => summary.failures) ? 1 : 0, stdout: JSON.stringify(comparison, null, 2) };
       });
     }
-    return { exitCode: !args.length || args.length === 1 && ["--help", "-h"].includes(args[0]!) ? 0 : 1, stdout: "Usage: bb nudger <status|continuation [<threadId> [on|off]]|verify|shadow --confirm-paid-synthetic>" };
+    return { exitCode: !args.length || args.length === 1 && ["--help", "-h"].includes(args[0]!) ? 0 : 1, stdout: "Usage: bb nudger <status|continuation [<threadId> [on|off]]|decisions [--since <date>] [--out <path>]|label <recordId> <wrong|clear>|verify|shadow --confirm-paid-synthetic>" };
   } });
   settings.onChange(() => {
     settingsRevision++;

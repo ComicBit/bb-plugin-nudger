@@ -43,11 +43,32 @@ bb nudger continuation <threadId>
 bb nudger continuation <threadId> off
 bb nudger continuation <threadId> on
 bb nudger verify
+bb nudger decisions [--since <ISO date|epoch ms>] [--out <path>]
+bb nudger label '<recordId>' wrong [--by <name>] [--note <text>]
+bb nudger label '<recordId>' clear
 ```
 
-`status`, continuation reads, and `verify` do not request a model. `verify` validates a stored complete synthetic validation for the exact currently selected detector; it is not a safety certification.
+`status`, continuation reads, `decisions` and `verify` do not request a model. `verify` validates a stored complete synthetic validation for the exact currently selected detector; it is not a safety certification.
 
 Only an explicit `bb nudger shadow --confirm-paid-synthetic` runs Jev against the bundled synthetic corpus, requires the TypeSafe key, and incurs detector calls. It never dispatches project messages. Do not run it for a release smoke that prohibits paid calls. All detector calls, including errors and synthetic validation calls, go through the persisted per-day ledger.
+
+## Decision log
+
+Nudger keeps why it decided what it did with every observed ending, whatever the action (observed, finished, reported, suppressed, nudged, discarded, error), for **30 days**, so its quality can be studied and improved later.
+
+- **Storage.** Each decision is one KV row `recovery.records.<recordId>`; the judged final message (capped at 24,576 characters, like a published obstacle) is written once beside it at `recovery.text.<recordId>` as Brotli-compressed base64 (`{"br":"…"}`, about half the size of the raw text). Rewrites of an unchanged record are skipped.
+- **Budget.** Hard caps of 10,000 decisions and 24 MiB (record JSON plus stored text); over either, the oldest decisions are pruned first, and the ones the v1 history view still publishes (each thread's latest, nudges inside the 183-day daily history, the detector's newest outcome, the coverage anchor) go last. Past 30 days only those history-view records remain, without text.
+- **v1 unchanged.** `nudger_snapshot_v1`/`nudger_history_v1` publish the same records and fields as before (the last week, 183 days of nudges, each thread's latest), so Headquarters reads no more and outcomes or labels never change its history digest.
+- **Export.** `nudger_decisions_v1({version:1,cursor:null|string,since?:epochMs})` → `{version:1,decisions,nextCursor}`, oldest first, at most 200 rows/256 KiB per page; the cursor is the last row's `observedAt:id` and stays valid while older rows are pruned. `bb nudger decisions` writes every page as JSON Lines (one decision per line) to `--out` (relative to your working directory) or `<BB data dir>/plugins/nudger/exports/decisions-<time>.jsonl`, and prints the path and counts. Native clients and Headquarters may read it; other plugins may not.
+- **Labels.** `nudger_label_v1({version:1,recordId,label:"wrong"|null,note?,by})` (or `bb nudger label`) marks a decision wrong, or clears it. The label lives on the record, survives restarts and pruning until the record ages out, and is exported, so labelled decisions form a test set. Native clients and Headquarters only.
+
+Each exported decision is a v1 record (`id`, `threadId`, `projectId`, `runId`, `messageId`, `messageRevision`, `observedAt`, `classification`, `action`, `reason`, `detector`, `judgment` with every Jev question's `choice`, `confidence` and `probabilities`) plus:
+
+- `gate`: stable id of what decided `action`, `reason` being its wording. Admission: `pending`, `no-detector`, `paused`, `identities-unavailable`, `policy-changed`, `cancelled-before-classification`, `workflow-hold`, `maintenance`, `restart`. Lifecycle: `superseded`, `operator-stop`, `history-reset`, `thread-archived`, `ineligible`, `not-followable`, `observation-failed`, `detector-changed`, `disposed`, `control-thread`, `stale-ending`. Verdict: `nudge-scheduled`, `auto-continue-off`, `finished`, `obstacle`, `obstacle-reported`, `detector-error`, `no-credits`, `rejudged`. Null on records from before the log existed.
+- `text`, `textTruncated`: the judged final message.
+- `nudge`: `{nudgeId, text, scheduledAt, sendAt, state, gate, reason}` for a scheduled nudge: the exact text sent and its fate. Its send-time `gate` is `operator-cancel`, `operator-replied`, `auto-continue-off`, `paused`, `operator-stop`, `superseded`, `fresh-activity`, `active-execution`, `message-changed`, `workflow-hold`, `queued`, `maintenance`, `restart`, `send-failed`, `nudge-cancelled` or `nudge-withheld`; null while pending or once sent.
+- `outcome`: what the thread did next within 24 hours, settled once: `next-ending` (`nextRecordId` plus that ending's `classification`/`action` as they settle), `stopped` (a manual Stop), `cancelled` (you cancelled the countdown, turned the thread off, paused, or replied first), or `none` (nothing within 24 hours; filled lazily). Null while the window is open, and on records from before the log existed.
+- `label`: `{label:"wrong", note, by, at}` or null.
 
 ## Optional Headquarters integration and migration
 

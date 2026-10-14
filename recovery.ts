@@ -1,13 +1,13 @@
 import { z } from "zod";
 import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk";
 import { SCHEDULED_REASON, type Continuation } from "./continuation.js";
-import { CANCEL_REASON, HELD_REASON, WITHHELD_REASON } from "./continuation-copy.js";
-/** Six months of daily nudge history, independently of any dashboard consumer. */
-const DAILY_HISTORY_DAYS = 183;
-import type { FinalMessageClassifier, RecoveryBlocker, RecoveryCursor, RecoveryInventoryProject, RecoveryInventoryThread, RecoveryRecord, RecoveryService, RecoveryStatus, RecoveryThreadState, RecoveryWorkflowWait, ThreadEventRow } from "./recovery-contract.js";
+import { CANCEL_REASON, HELD_REASON, isNoCreditsError, WITHHELD_REASON } from "./continuation-copy.js";
+import { RECOVERY_NUDGE, type FinalMessageClassifier, type RecoveryBlocker, type RecoveryCursor, type RecoveryInventoryProject, type RecoveryInventoryThread, type RecoveryNudgeDecision, type RecoveryRecord, type RecoveryService, type RecoveryStatus, type RecoveryThreadState, type RecoveryWorkflowWait, type ThreadEventRow } from "./recovery-contract.js";
 import { createKvWriter } from "./kv-writer.js";
 import { WORKFLOW_SETTLE_MS, workflowOwner, workflowStepRunning } from "./workflow-steps.js";
-import { retainedKeys, retainedValue } from "./migration-storage.js";
+import { LEGACY_DATA_PREFIX, retainedKeys, retainedValue } from "./migration-storage.js";
+import { DECISION_LIMITS, decisionCursor, decisionsAfter, decodeText, encodeText, GATE, historyRecord, historyRecordIds, noneOutcome, nudgeGate, operatorCancelled, OUTCOME_WINDOW_MS, planRetention, RECORD_KEY, TEXT_KEY, toDecision } from "./decision-log.js";
+import { PAGE_BYTES } from "./publication.js";
 type ThreadResponse = PluginThreadEventPayloads["thread.idle"]["thread"];
 
 export interface RecoveryObservation {
@@ -61,18 +61,26 @@ export interface RecoveryServiceOptions {
   continuation?: Pick<Continuation, "enabled" | "schedule" | "cancel" | "latest">;
 }
 
+const classificationSchema = z.enum(["continue", "finished", "blocker", "permission", "uncertainty"]);
+const actionSchema = z.enum(["observed", "finished", "reported", "suppressed", "nudged", "discarded", "error"]);
 const recordSchema: z.ZodType<RecoveryRecord> = z.object({
   id: z.string(), threadId: z.string(), projectId: z.string(), runId: z.string(), messageId: z.string(),
   messageRevision: z.number().int().nonnegative(), observedAt: z.number(),
-  classification: z.enum(["continue", "finished", "blocker", "permission", "uncertainty"]).nullable(),
-  action: z.enum(["observed", "finished", "reported", "suppressed", "nudged", "discarded", "error"]),
+  classification: classificationSchema.nullable(), action: actionSchema,
   reason: z.string(), detector: z.string().nullable(),
   judgment: z.object({
-    classification: z.enum(["continue", "finished", "blocker", "permission", "uncertainty"]), model: z.string(), latencyMs: z.number(),
+    classification: classificationSchema, model: z.string(), latencyMs: z.number(),
     usage: z.object({ inputTokens: z.number().nullable(), outputTokens: z.number().nullable(), cost: z.object({ amount: z.number(), currency: z.string() }).nullable() }),
     confidence: z.number().nullable(), probabilities: z.record(z.string(), z.number()).nullable(),
     questions: z.record(z.string(), z.object({ choice: z.string(), confidence: z.number(), probabilities: z.record(z.string(), z.number()) })).nullable(),
   }).nullable(),
+  gate: z.string().optional(),
+  text: z.object({ chars: z.number(), bytes: z.number(), truncated: z.boolean() }).optional(),
+  nudge: z.object({ nudgeId: z.string(), text: z.string(), scheduledAt: z.number(), sendAt: z.number(), state: z.enum(["pending", "cancelled", "sent", "withheld"]),
+    gate: z.string().nullable(), reason: z.string().nullable() }).optional(),
+  outcome: z.object({ kind: z.enum(["next-ending", "stopped", "cancelled", "none"]), at: z.number(), nextRecordId: z.string().nullable(),
+    classification: classificationSchema.nullable(), action: actionSchema.nullable(), reason: z.string().nullable() }).optional(),
+  label: z.object({ label: z.literal("wrong"), note: z.string().nullable(), by: z.string(), at: z.number() }).optional(),
 });
 const historyTypes = ["turn/started", "turn/completed", "item/completed", "system/thread/interrupted", "thread/context/cleared", "thread/compacted",
   "client/turn/requested", "client/turn/rejected", "turn/input/accepted"] as const;
@@ -104,31 +112,8 @@ function hasActiveExecutionSignal(thread: ObservedThread): boolean {
 
 const PENDING_REASON = "Live public root ending observed; final-message-only classification pending";
 const HELD: Record<string, true> = { [HELD_REASON.workflow]: true, [HELD_REASON.maintenance]: true };
-const DAY_MS = 86_400_000;
-/** Every record is kept this long; older ones only while a reader still needs them (see retainedRecordIds). */
-export const RECORD_RECENT_MS = 7 * DAY_MS;
+const HELD_GATE: Record<string, string> = { [HELD_REASON.workflow]: GATE.workflow, [HELD_REASON.maintenance]: GATE.maintenance };
 const PRUNE_INTERVAL_MS = 3_600_000;
-
-/**
- * The records worth keeping at `now`: the last week's; nudges inside the dashboard's daily history; each
- * thread's latest (recovery's own state); each detector's newest call outcome (the out-of-credits warning);
- * and the oldest, which anchors the nudge history's coverage start.
- */
-export function retainedRecordIds(records: readonly RecoveryRecord[], now: number): Set<string> {
-  const keep = new Set<string>();
-  const latest = new Map<string, RecoveryRecord>();
-  const outcomes = new Map<string, RecoveryRecord>();
-  let oldest: RecoveryRecord | null = null;
-  for (const record of records) {
-    const age = now - record.observedAt;
-    if (age <= RECORD_RECENT_MS || (record.action === "nudged" && age <= DAILY_HISTORY_DAYS * DAY_MS)) keep.add(record.id);
-    if (record.observedAt >= (latest.get(record.threadId)?.observedAt ?? -Infinity)) latest.set(record.threadId, record);
-    if (record.detector !== null && (record.judgment !== null || record.action === "error") && record.observedAt >= (outcomes.get(record.detector)?.observedAt ?? -Infinity)) outcomes.set(record.detector, record);
-    if (!oldest || record.observedAt < oldest.observedAt) oldest = record;
-  }
-  for (const record of [...latest.values(), ...outcomes.values(), ...(oldest ? [oldest] : [])]) keep.add(record.id);
-  return keep;
-}
 
 export function createRecoveryService(options: RecoveryServiceOptions): RecoveryService {
   const { bb } = options;
@@ -144,9 +129,13 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
   const liveBaselines = new Map<string, { thread: ObservedThread; rows: Promise<ThreadEventRow[] | null>; window: ClassificationWindow }>();
   const jobs = new Map<string, ClassificationJob>();
   const records: RecoveryRecord[] = [];
-  const recordIds = new Set<string>();
+  const recordsById = new Map<string, RecoveryRecord>();
   // Records are mutated in place, so the latest reference per thread stays current.
   const latestRecords = new Map<string, RecoveryRecord>();
+  // Each record whose outcome is a next ending, by that next ending's id: its classification/action settle later.
+  const predecessors = new Map<string, RecoveryRecord>();
+  // Stored bytes per record (its JSON plus its text), for the decision log's hard cap.
+  const storedBytes = new Map<string, number>();
   // Only a successful judgment from this runtime and the same detector instance can survive a hold.
   let successfulJudgments = new WeakMap<RecoveryRecord, NonNullable<RecoveryRecord["judgment"]>>();
   // Running hidden workflow steps per owner thread, each running step's owner, and when an owner
@@ -186,9 +175,14 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       projects, watchedCount: [...inventory.keys()].filter(id => tracker.isWatching(id)).length, error };
   }
   function addRecord(record: RecoveryRecord): void {
-    records.push(record); recordIds.add(record.id);
+    records.push(record); recordsById.set(record.id, record);
+    storedBytes.set(record.id, Buffer.byteLength(JSON.stringify(record)) + (record.text?.bytes ?? 0));
     const latest = latestRecords.get(record.threadId);
     if (!latest || record.observedAt >= latest.observedAt) latestRecords.set(record.threadId, record);
+  }
+  /** Records what decided the record's action, and why. */
+  function decide(record: RecoveryRecord, action: RecoveryRecord["action"], gate: string, reason: string): void {
+    record.action = action; record.gate = gate; record.reason = reason;
   }
   function changed(): void {
     if (disposed) return;
@@ -199,46 +193,96 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     mutations = next;
     return next;
   }
-  function persist(record: RecoveryRecord): Promise<void> {
-    return bb.storage.kv.set(`recovery.records.${record.id}`, record);
+  /** Writes the record (skipped when storage already holds it as-is) and settles its predecessor's next-ending outcome. */
+  async function persist(record: RecoveryRecord): Promise<void> {
+    if (recordsById.get(record.id) === record) storedBytes.set(record.id, Buffer.byteLength(JSON.stringify(record)) + (record.text?.bytes ?? 0));
+    await kv.set(`${RECORD_KEY}${record.id}`, record);
+    const previous = predecessors.get(record.id);
+    const outcome = previous?.outcome;
+    if (!previous || outcome?.nextRecordId !== record.id || (outcome.classification === record.classification && outcome.action === record.action)) return;
+    outcome.classification = record.classification; outcome.action = record.action;
+    await persist(previous);
   }
-  /** Drops records no reader needs any more (at most hourly); runs inside `serial`. */
-  async function pruneRecords(): Promise<void> {
+  /**
+   * Sets the latest decision's outcome when nothing settled it yet and `at` falls inside its outcome window. Records
+   * from before the decision log (no gate) get none: nothing was watching what followed them.
+   */
+  function settleOutcome(threadId: string, kind: "stopped" | "cancelled", at: number, reason: string): void {
+    const record = latestRecords.get(threadId);
+    if (record?.gate === undefined || record.outcome || at < record.observedAt || at - record.observedAt > OUTCOME_WINDOW_MS) return;
+    record.outcome = { kind, at, nextRecordId: null, classification: null, action: null, reason };
+    void serial(() => persist(record)).catch(caught => bb.log.warn(`Recovery outcome persistence failed: ${String(caught)}`));
+  }
+  /** Mirrors the thread's latest nudge onto the decision it was scheduled for; the operator cancelling it is that decision's outcome. */
+  function noteNudge(threadId: string): void {
+    const nudge = options.continuation?.latest(threadId);
+    const record = latestRecords.get(threadId);
+    if (disposed || !nudge || !record || nudge.runId !== record.runId || nudge.messageId !== record.messageId || nudge.messageRevision !== record.messageRevision) return;
+    const next: RecoveryNudgeDecision = { nudgeId: nudge.nudgeId, text: RECOVERY_NUDGE, scheduledAt: nudge.createdAt, sendAt: nudge.sendAt,
+      state: nudge.state, gate: nudgeGate(nudge.state, nudge.cancelReason), reason: nudge.cancelReason };
+    if (JSON.stringify(next) === JSON.stringify(record.nudge)) return;
+    record.nudge = next;
+    if (nudge.state === "cancelled" && operatorCancelled(nudge.cancelReason)) settleOutcome(threadId, "cancelled", Date.now(), nudge.cancelReason!);
+    void serial(() => persist(record)).catch(caught => bb.log.warn(`Recovery nudge persistence failed: ${String(caught)}`));
+  }
+  /** Decisions whose outcome window passed with nothing observed settle as "none"; runs inside `serial`. */
+  async function settleExpiredOutcomes(now: number): Promise<void> {
+    for (const record of records) {
+      if (record.gate === undefined || record.outcome || now - record.observedAt < OUTCOME_WINDOW_MS) continue;
+      record.outcome = noneOutcome(record);
+      await persist(record);
+    }
+  }
+  /**
+   * Drops what the decision log and the v1 history view no longer need (at most hourly, or at once over a hard cap);
+   * runs inside `serial`.
+   */
+  async function pruneRecords(force = false): Promise<void> {
     const now = Date.now();
-    if (now - prunedAt < PRUNE_INTERVAL_MS) return;
+    if (!force && now - prunedAt < PRUNE_INTERVAL_MS) return;
     prunedAt = now;
-    const keep = retainedRecordIds(records, now);
-    const dropped = records.filter(record => !keep.has(record.id));
-    if (!dropped.length) return;
-    records.splice(0, records.length, ...records.filter(record => keep.has(record.id)));
     try {
+      await settleExpiredOutcomes(now);
+      const { drop, dropText } = planRetention(records, record => storedBytes.get(record.id) ?? 0, now);
+      if (!drop.size && !dropText.size) return;
+      const dropped = records.filter(record => drop.has(record.id));
+      records.splice(0, records.length, ...records.filter(record => !drop.has(record.id)));
       for (const record of dropped) {
-        recordIds.delete(record.id);
-        await bb.storage.kv.delete(`recovery.records.${record.id}`);
+        recordsById.delete(record.id); storedBytes.delete(record.id); predecessors.delete(record.id);
+        if (latestRecords.get(record.threadId) === record) latestRecords.delete(record.threadId);
+      }
+      for (const [nextId, previous] of predecessors) if (drop.has(previous.id)) predecessors.delete(nextId);
+      for (const record of dropped) {
+        await kv.delete(`${RECORD_KEY}${record.id}`);
+        if (record.text) await bb.storage.kv.delete(`${TEXT_KEY}${record.id}`);
+      }
+      for (const id of dropText) {
+        const record = recordsById.get(id)!;
+        delete record.text;
+        await persist(record);
+        await bb.storage.kv.delete(`${TEXT_KEY}${id}`);
       }
     } catch (caught) { bb.log.warn(`Recovery record pruning deferred: ${String(caught)}`); }
   }
   /**
-   * Cancels in-flight classification, recording `reason` on its ending. Anything that cancels it,
+   * Cancels in-flight classification, recording `gate`/`reason` on its ending. Anything that cancels it,
    * other than a new hold, also ends a held ending's wait.
    */
-  function cancelClassifications(reason: string, threadId?: string): void {
+  function cancelClassifications(gate: string, reason: string, threadId?: string): void {
     const canceled: RecoveryRecord[] = [];
     for (const [id, job] of jobs) {
       if (threadId !== undefined && job.record.threadId !== threadId) continue;
       job.controller.abort();
       jobs.delete(id);
       if (job.record.action !== "observed") continue;
-      job.record.action = "suppressed";
-      job.record.reason = reason;
+      decide(job.record, "suppressed", gate, reason);
       canceled.push(job.record);
     }
     if (HELD[reason] !== true) {
       for (const id of threadId === undefined ? [...latestRecords.keys()] : [threadId]) {
         const held = heldEnding(id);
         if (!held) continue;
-        held.action = "suppressed";
-        held.reason = reason;
+        decide(held, "suppressed", gate, reason);
         canceled.push(held);
       }
     }
@@ -248,13 +292,12 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     }
   }
   /** A job that found its own ending stale stops; other jobs and holds on the thread are not its to cancel. */
-  function abandon(job: ClassificationJob, reason: string): void {
+  function abandon(job: ClassificationJob, gate: string, reason: string): void {
     job.controller.abort();
     if (jobs.get(job.record.id) !== job) return;
     jobs.delete(job.record.id);
     if (job.record.action !== "observed") return;
-    job.record.action = "suppressed";
-    job.record.reason = reason;
+    decide(job.record, "suppressed", gate, reason);
     void serial(() => persist(job.record)).catch(caught => bb.log.warn(`Recovery cancellation persistence failed: ${String(caught)}`));
     changed();
   }
@@ -288,8 +331,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       || hasActiveExecutionSignal(thread) || inventory.get(threadId)?.exclusion !== null || cursor.runId !== record.runId
       || cursor.finalMessage.id !== record.messageId || cursor.finalMessage.revision !== record.messageRevision) return;
     const previousJudgment = successfulJudgments.get(record) ?? null;
-    record.action = "observed";
-    record.reason = PENDING_REASON;
+    decide(record, "observed", GATE.pending, PENDING_REASON);
     record.classification = null;
     record.judgment = null;
     record.detector = selected.id;
@@ -299,14 +341,13 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
   }
   /** A maintenance turn started: the previous ending's classification and nudge wait until it finishes. */
   function holdForMaintenance(threadId: string): void {
-    cancelClassifications(HELD_REASON.maintenance, threadId);
+    cancelClassifications(GATE.maintenance, HELD_REASON.maintenance, threadId);
     options.continuation?.cancel(threadId, CANCEL_REASON.maintenance);
     const record = latestRecords.get(threadId);
     const nudge = options.continuation?.latest(threadId);
     if (record?.action !== "nudged" || nudge?.state !== "cancelled" || nudge.cancelReason !== CANCEL_REASON.maintenance
       || nudge.runId !== record.runId || nudge.messageId !== record.messageId || nudge.messageRevision !== record.messageRevision) return;
-    record.action = "suppressed";
-    record.reason = HELD_REASON.maintenance;
+    decide(record, "suppressed", GATE.maintenance, HELD_REASON.maintenance);
     void serial(() => persist(record)).catch(caught => bb.log.warn(`Recovery hold persistence failed: ${String(caught)}`));
     changed();
   }
@@ -381,7 +422,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     return { threadId, runId: cursor.runId, active, eligible: true, suppressedByStop: cursor.knownStop, finalMessage: cursor.finalMessage };
   }
   function startRun(cursor: Cursor, threadId: string, turnId: string): void {
-    if (cursor.runId !== turnId) cancelClassifications("A later root execution superseded the classified ending", threadId);
+    if (cursor.runId !== turnId) cancelClassifications(GATE.superseded, "A later root execution superseded the classified ending", threadId);
     cursor.runId = turnId;
     cursor.finalMessage = null;
   }
@@ -396,7 +437,8 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         void serial(() => bb.storage.kv.set(`recovery.stopped.${row.threadId}`, true))
           .catch(caught => bb.log.warn(`Recovery Stop persistence failed: ${String(caught)}`));
       }
-      cancelClassifications("Observed manual Stop; waits for your next message to re-arm", row.threadId);
+      settleOutcome(row.threadId, "stopped", row.createdAt, CANCEL_REASON.stop);
+      cancelClassifications(GATE.stop, "Observed manual Stop; waits for your next message to re-arm", row.threadId);
     }
     if (row.type === "client/turn/requested") {
       // A `/compact` command, by its mention rather than its text, asks for a maintenance turn instead of new work.
@@ -415,7 +457,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     if (row.type === "thread/context/cleared" || (row.type === "thread/compacted" && !ownCompaction)) {
       cursor.runId = null;
       cursor.finalMessage = null;
-      cancelClassifications("Root history was cleared or compacted before classification admission", row.threadId);
+      cancelClassifications(GATE.historyReset, "Root history was cleared or compacted before classification admission", row.threadId);
       return "reset";
     }
     if (row.scope.kind !== "turn") return null;
@@ -463,44 +505,42 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         await ready;
         if (job.controller.signal.aborted || disposed) return;
         const controlsBeforeCall = await options.controlThreadIds();
-        if (controlsBeforeCall.includes(record.threadId)) { abandon(job, "Thread became a control conversation before classification"); return; }
+        if (controlsBeforeCall.includes(record.threadId)) { abandon(job, GATE.control, "Thread became a control conversation before classification"); return; }
         if (job.controller.signal.aborted || disposed) return;
         const judgment = previousJudgment ?? await selected.classify(ending.finalMessage!.text, { signal: job.controller.signal });
         if (job.controller.signal.aborted || disposed) return;
         const controlsBeforeRouting = await options.controlThreadIds();
-        if (controlsBeforeRouting.includes(record.threadId)) { abandon(job, "Thread became a control conversation before routing"); return; }
+        if (controlsBeforeRouting.includes(record.threadId)) { abandon(job, GATE.control, "Thread became a control conversation before routing"); return; }
         if (job.controller.signal.aborted || disposed) return;
         let validatedVersion = 0;
         const blocker = await serial(async (): Promise<RecoveryBlocker | null> => {
           if (!currentEnding(job)) {
-            abandon(job, "The observed root ending is no longer current for classification routing");
+            abandon(job, GATE.stale, "The observed root ending is no longer current for classification routing");
             return null;
           }
           const thread = remember(await bb.sdk.threads.get({ threadId: record.threadId }));
           validatedVersion = latestThreads.get(thread.id)?.version ?? 0;
           await observe(thread);
           if (!currentEnding(job) || (latestThreads.get(thread.id)?.version ?? 0) !== validatedVersion) {
-            abandon(job, "Lifecycle or final-message evidence changed before classification routing");
+            abandon(job, GATE.stale, "Lifecycle or final-message evidence changed before classification routing");
             return null;
           }
           const nextRecord: RecoveryRecord = { ...record, classification: judgment.classification, judgment };
           if (judgment.classification === "continue" && options.continuation?.enabled(record.threadId)) {
             // Workflow release may reuse this judgment, but admission and the nudge are always fresh.
             const held = holdReason(record.threadId);
-            nextRecord.action = held ? "suppressed" : "nudged";
-            nextRecord.reason = held ?? SCHEDULED_REASON;
+            if (held) decide(nextRecord, "suppressed", HELD_GATE[held]!, held);
+            else decide(nextRecord, "nudged", GATE.nudge, SCHEDULED_REASON);
           } else if (judgment.classification === "continue") {
-            nextRecord.action = "suppressed";
-            nextRecord.reason = "Continuation candidate classified, but auto-continue is off for this thread";
+            decide(nextRecord, "suppressed", GATE.autoContinueOff, "Continuation candidate classified, but auto-continue is off for this thread");
           } else if (judgment.classification === "finished") {
-            nextRecord.action = "finished";
-            nextRecord.reason = "Selected detector classified the same live root final assistant message as finished; no continuation dispatched";
+            decide(nextRecord, "finished", GATE.finished, "Selected detector classified the same live root final assistant message as finished; no continuation dispatched");
           } else {
-            nextRecord.reason = "Live final-message obstacle classified; reporting is not authorization or continuation admission";
+            decide(nextRecord, nextRecord.action, GATE.obstacle, "Live final-message obstacle classified; reporting is not authorization or continuation admission");
           }
           await persist(nextRecord);
           if (!currentEnding(job) || (latestThreads.get(thread.id)?.version ?? 0) !== validatedVersion) {
-            abandon(job, "Classification result canceled while it was being persisted");
+            abandon(job, GATE.stale, "Classification result canceled while it was being persisted");
             return null;
           }
           Object.assign(record, nextRecord);
@@ -508,9 +548,9 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
           changed();
           if (record.action === "nudged") {
             const nudge = await options.continuation!.schedule(record);
+            noteNudge(record.threadId);
             if (nudge.state === "cancelled" || nudge.state === "withheld") {
-              record.action = "suppressed";
-              record.reason = `Continuation ${nudge.state}: ${nudge.cancelReason ?? "no reason recorded"}`;
+              decide(record, "suppressed", nudgeGate(nudge.state, nudge.cancelReason)!, `Continuation ${nudge.state}: ${nudge.cancelReason ?? "no reason recorded"}`);
               await persist(record);
               changed();
             }
@@ -524,14 +564,13 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         if (!blocker) return;
         // Pause/configuration/Stop/disposal can happen while persistence is awaited.
         if (!currentEnding(job) || (latestThreads.get(record.threadId)?.version ?? 0) !== validatedVersion) {
-          abandon(job, "Classification routing canceled by newer lifecycle evidence");
+          abandon(job, GATE.stale, "Classification routing canceled by newer lifecycle evidence");
           return;
         }
         await options.reportBlocker(blocker);
         await serial(async () => {
           if (disposed || job.controller.signal.aborted) return;
-          record.action = "reported";
-          record.reason = "Live final-message obstacle published by Nudger; no project work or continuation authorized";
+          decide(record, "reported", GATE.reported, "Live final-message obstacle published by Nudger; no project work or continuation authorized");
           await persist(record);
           changed();
         });
@@ -539,8 +578,8 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         if (disposed || job.controller.signal.aborted) return;
         await serial(async () => {
           if (disposed || job.controller.signal.aborted) return;
-          record.action = "error";
-          record.reason = `Final-message classification/reporting failed: ${caught instanceof Error ? caught.message : String(caught)}`;
+          const reason = `Final-message classification/reporting failed: ${caught instanceof Error ? caught.message : String(caught)}`;
+          decide(record, "error", isNoCreditsError(reason) ? GATE.noCredits : GATE.detectorError, reason);
           await persist(record);
           changed();
         });
@@ -552,24 +591,37 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
   async function recordEnding(thread: ObservedThread, ending: RecoveryObservation, window: ClassificationWindow, ready?: Promise<void>): Promise<void> {
     if (!ending.runId || !ending.finalMessage) return;
     const id = JSON.stringify([thread.id, ending.runId]);
-    if (recordIds.has(id)) return;
+    if (recordsById.has(id)) return;
     const selected = detector;
     const canClassify = (initialized || starting !== null) && !disposed && identitiesKnown && !paused
       && !window.paused && window.epoch === classificationEpoch && selected !== null;
     // A thread waiting on its workflow keeps its ending unjudged until the wait ends.
     const held = canClassify ? holdReason(thread.id) : null;
+    const unclassifiedGate = !selected ? GATE.noDetector : paused || window.paused ? GATE.paused : !identitiesKnown ? GATE.identities : GATE.policyChanged;
+    const { value: text, ref } = encodeText(ending.finalMessage.text);
     const record: RecoveryRecord = { id, threadId: thread.id, projectId: thread.projectId, runId: ending.runId,
       messageId: ending.finalMessage.id, messageRevision: ending.finalMessage.revision, observedAt: Date.now(),
       classification: null, action: canClassify && !held ? "observed" : "suppressed",
       reason: held ?? (canClassify ? PENDING_REASON
         : `${selected ? "Classification paused or policy changed before ending admission" : "No operational detector selected"}; live ending inventoried without historical replay or dispatch`),
-      detector: selected?.id ?? null, judgment: null };
+      detector: selected?.id ?? null, judgment: null,
+      gate: held ? HELD_GATE[held]! : canClassify ? GATE.pending : unclassifiedGate, text: ref };
+    const previous = latestRecords.get(thread.id);
     addRecord(record);
+    await bb.storage.kv.set(`${TEXT_KEY}${id}`, text);
     await persist(record);
+    if (previous?.gate !== undefined && !previous.outcome) {
+      // The next ending is the previous decision's outcome only inside its window.
+      previous.outcome = record.observedAt - previous.observedAt > OUTCOME_WINDOW_MS ? noneOutcome(previous)
+        : { kind: "next-ending", at: record.observedAt, nextRecordId: id, classification: record.classification, action: record.action, reason: null };
+      if (previous.outcome.kind === "next-ending") predecessors.set(id, previous);
+      await persist(previous);
+    }
+    if (records.length > DECISION_LIMITS.count || [...storedBytes.values()].reduce((sum, bytes) => sum + bytes, 0) > DECISION_LIMITS.bytes) await pruneRecords(true);
     if (held) return;
     if (canClassify && selected && !paused && !disposed && detector === selected && window.epoch === classificationEpoch) classifyEnding(record, ending, selected, ready);
     else if (record.action === "observed") {
-      record.action = "suppressed"; record.reason = "Classification was canceled before it began";
+      decide(record, "suppressed", GATE.cancelledBeforeStart, "Classification was canceled before it began");
       await persist(record);
     }
   }
@@ -640,14 +692,14 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     if (disposed) return;
     noteWorkflowStep(thread);
     if (thread.archivedAt !== null || thread.deletedAt !== null) {
-      cancelClassifications("Thread archived or deleted", thread.id);
+      cancelClassifications(GATE.archived, "Thread archived or deleted", thread.id);
       inventory.delete(thread.id); cursors.delete(thread.id); liveBaselines.delete(thread.id); tracker.forget(thread.id); return;
     }
     inventory.set(thread.id, { id: thread.id, projectId: thread.projectId, title: thread.title ?? thread.titleFallback,
       status: thread.status, hostId: inventory.get(thread.id)?.hostId ?? null,
       visibility: thread.visibility, parentThreadId: thread.parentThreadId, watched: false, exclusion: excluded });
     if (excluded) {
-      cancelClassifications(`Thread became ineligible: ${excluded}`, thread.id);
+      cancelClassifications(GATE.ineligible, `Thread became ineligible: ${excluded}`, thread.id);
       tracker.forget(thread.id); cursors.delete(thread.id); liveBaselines.delete(thread.id); return;
     }
     let cursor = cursors.get(thread.id);
@@ -674,7 +726,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       rows.push(...batch);
       if (batch.length < 100) break;
       const nextSeq = Math.max(...batch.map(row => row.seq));
-      if (nextSeq <= afterSeq || page === 3) { cancelClassifications("Incremental public history exceeded the bounded observation window", thread.id); await baseline(thread); return; }
+      if (nextSeq <= afterSeq || page === 3) { cancelClassifications(GATE.notFollowable, "Incremental public history exceeded the bounded observation window", thread.id); await baseline(thread); return; }
       afterSeq = nextSeq;
     }
     // Endings are judged only once the whole batch is applied, so one a later row already replaced
@@ -713,7 +765,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       identitiesKnown = true;
     } catch (caught) {
       identitiesKnown = false;
-      cancelClassifications("Owned control-role identities became unavailable");
+      cancelClassifications(GATE.identities, "Owned control-role identities became unavailable");
       roleError = caught instanceof Error ? caught.message : String(caught);
     }
     try {
@@ -781,7 +833,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
             if (!initialized || disposed) return;
             try { await observe(committed, window); if (!disposed) { lastObservedAt = Date.now(); changed(); } }
             catch (caught) {
-              cancelClassifications("Thread observation failed before classification routing", thread.id);
+              cancelClassifications(GATE.observationFailed, "Thread observation failed before classification routing", thread.id);
               tracker.forget(thread.id); cursors.delete(thread.id);
               error = caught instanceof Error ? caught.message : String(caught);
               bb.log.warn(`Recovery observation failed: ${error}`); changed();
@@ -804,15 +856,19 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         const at = z.number().optional().parse(await retainedValue(bb.storage.kv, key));
         if (at !== undefined) rearmedAt.set(key.slice("recovery.rearmed.".length), at);
       }
-      for (const key of await retainedKeys(bb.storage.kv, "recovery.records.")) {
-        const record = recordSchema.parse(await retainedValue(bb.storage.kv, key));
-        if (recordIds.has(record.id)) continue;
+      for (const key of await retainedKeys(bb.storage.kv, RECORD_KEY)) {
+        // The own row shadows the immutable imported one; the writer learns which of them storage holds.
+        const own = await bb.storage.kv.get(key);
+        kv.remember(key, own);
+        const record = recordSchema.parse(own ?? await bb.storage.kv.get(`${LEGACY_DATA_PREFIX}${key}`));
+        if (recordsById.has(record.id)) continue;
         // Persisted historical observations are never sent back to a detector, including endings a prior process held.
         if (record.action === "observed" || (record.action === "suppressed" && HELD[record.reason] === true)) {
-          record.action = "suppressed"; record.reason = "Prior process observation retained without historical classification replay"; await persist(record);
+          decide(record, "suppressed", GATE.restart, "Prior process observation retained without historical classification replay"); await persist(record);
         }
         addRecord(record);
       }
+      for (const record of records) if (record.outcome?.nextRecordId) predecessors.set(record.outcome.nextRecordId, record);
       await refreshInventory();
       if (disposed) return;
       initialized = true;
@@ -825,7 +881,35 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     start, refresh: () => {
       const window = { epoch: classificationEpoch, paused };
       return serial(() => refreshInventory(window));
-    }, status, records: () => structuredClone(records),
+    }, status,
+    records: () => {
+      const published = historyRecordIds(records, Date.now());
+      return records.filter(record => published.has(record.id)).map(historyRecord);
+    },
+    async decisions({ cursor, since }) {
+      const eligible = await serial(async () => { await settleExpiredOutcomes(Date.now()); return decisionsAfter(records, cursor, since); });
+      const decisions = [];
+      let bytes = 2;
+      for (const record of eligible) {
+        if (decisions.length === 200) break;
+        const text = record.text ? decodeText(await bb.storage.kv.get(`${TEXT_KEY}${record.id}`)) : null;
+        const decision = toDecision(record, text);
+        const size = Buffer.byteLength(JSON.stringify(decision)) + 1;
+        if (decisions.length && bytes + size > PAGE_BYTES) break;
+        decisions.push(decision); bytes += size;
+      }
+      return { decisions, nextCursor: decisions.length < eligible.length ? decisionCursor(decisions.at(-1)!) : null };
+    },
+    label(recordId, label) {
+      return serial(async () => {
+        const record = recordsById.get(recordId);
+        if (!record) return null;
+        if (label) record.label = label; else delete record.label;
+        await persist(record);
+        return toDecision(record, record.text ? decodeText(await bb.storage.kv.get(`${TEXT_KEY}${record.id}`)) : null);
+      });
+    },
+    noteNudge,
     cursor(threadId): RecoveryCursor | null {
       const cursor = cursors.get(threadId);
       if (disposed || !initialized || !cursor || inventory.get(threadId)?.exclusion !== null) return null;
@@ -881,14 +965,14 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       if (detector !== nextDetector) {
         classificationEpoch++;
         successfulJudgments = new WeakMap();
-        cancelClassifications("Selected operational detector changed");
+        cancelClassifications(GATE.detectorChanged, "Selected operational detector changed");
       }
       detector = nextDetector; changed(); return status();
     },
     async setPaused(nextPaused) {
       if (paused !== nextPaused) classificationEpoch++;
       paused = nextPaused;
-      if (paused) cancelClassifications("Passive classification paused; ending will not replay on resume");
+      if (paused) cancelClassifications(GATE.paused, "Passive classification paused; ending will not replay on resume");
       await kv.set("recovery.paused", paused); changed(); return status();
     },
     async dispose() {
@@ -897,7 +981,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       clearTimeout(reconciliationTimer); reconciliationTimer = undefined;
       for (const timer of settleTimers.values()) clearTimeout(timer);
       settleTimers.clear();
-      cancelClassifications("Recovery observer disposed before classification routing");
+      cancelClassifications(GATE.disposed, "Recovery observer disposed before classification routing");
       liveBaselines.clear();
       await mutations.catch(() => undefined);
       tracker.reconcile([]);

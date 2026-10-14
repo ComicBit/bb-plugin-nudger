@@ -1,7 +1,7 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { ContinuationStatus } from "./continuation-status.js";
-import { historyRequestSchema, historySchema, pauseSchema, snapshotSchema, versionSchema } from "./nudger-contract.js";
+import { decisionsRequestSchema, decisionsSchema, historyRequestSchema, historySchema, labelRequestSchema, labelSchema, pauseSchema, snapshotSchema, versionSchema } from "./nudger-contract.js";
 import { statsSchema } from "./stats.js";
 
 const threadSchema = z.object({ threadId: z.string().min(1).max(4096) }).strict();
@@ -22,4 +22,6 @@ export const rpcContract = defineRpcContract({
   nudger_settings_v1: { input: versionSchema, output: configurationSchema },
   nudger_settings_set_v1: { input: z.object({ version: z.literal(1), enabled: z.boolean().optional(), detector: z.enum(detectors).optional(), typesafeApiKey: z.string().max(8192).optional() }).strict(), output: configurationSchema },
   nudger_stats_v1: { input: versionSchema, output: statsSchema },
+  nudger_decisions_v1: { input: decisionsRequestSchema, output: decisionsSchema },
+  nudger_label_v1: { input: labelRequestSchema, output: labelSchema },
 });
