@@ -79,13 +79,15 @@ function fixture(options: { settings?: Record<string, string | boolean>; headqua
   }
   return { bb, harness, threads, history, controls, snapshot, dispatch, finish, until };
 }
-/** `ending: null` answers in the shape judgments had before the `ending`/`consequence` questions existed. */
+/** `ending: null` answers in the shape judgments had before the `ending`/`waits_on`/`consequence` questions existed. */
 function jevResponse(classification: "continue" | "blocker" | "finished", ending: "request" | "operator_chosen" | "report" | null = "report") {
+  const waitsOn = classification === "continue" ? "assistant" : classification === "finished" ? "nothing" : "operator";
   return new Response(JSON.stringify({ model: "jev-1.13.0", answers: {
     obstacle: { type: "choice", choice: classification === "blocker" ? "blocker" : "none", confidence: 1, probabilities: { none: classification === "blocker" ? 0 : 1, blocker: classification === "blocker" ? 1 : 0, permission: 0, uncertainty: 0 } },
     boundary: { type: "choice", choice: classification === "finished" ? "finished" : "continue", confidence: 1, probabilities: { continue: classification === "finished" ? 0 : 1, finished: classification === "finished" ? 1 : 0, uncertainty: 0 } },
     ...ending && {
       ending: { type: "choice", choice: ending, confidence: 1, probabilities: { request: 0, operator_chosen: 0, report: 0, [ending]: 1 } },
+      waits_on: { type: "choice", choice: waitsOn, confidence: 1, probabilities: { assistant: 0, running: 0, operator: 0, nothing: 0, [waitsOn]: 1 } },
       consequence: { type: "choice", choice: "none", confidence: 1, probabilities: { money: 0, data: 0, production: 0, "priority-product": 0, irreversible: 0, none: 1 } },
     },
   }, usage: { input_tokens: 42, output_tokens: 3 } }), { status: 200, headers: { "content-type": "application/json" } });

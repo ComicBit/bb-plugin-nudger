@@ -91,12 +91,12 @@ export function ContinuationBanner() {
   const fraction = counting && status.totalMs ? Math.min(1, remaining / status.totalMs) : 0;
   // Watching needs no words: the open eye already says it. A waiting line's detail (its step count) updates in place.
   const shown: Shown | null = counting
-    ? nudging ? { key: "nudging", line: LINE.nudging } : { key: "countdown", line: countdownLine(Math.ceil(remaining / 1_000)) }
+    ? nudging ? { key: "nudging", line: LINE.nudging } : { key: "countdown", line: countdownLine(Math.ceil(remaining / 1_000), status.checkIn) }
     : on && status.state !== "watching" && status.text !== null
       ? { key: `${status.state}:${status.text}${status.state === "waiting" ? "" : `:${status.detail ?? ""}`}`, line: { text: status.text, detail: status.detail } }
       : null;
   // The ticking text is hidden from screen readers; they hear the countdown once, then "Continuing…".
-  const announced = counting ? nudging ? LINE.nudging : countdownLine(Math.ceil((status.sendAt! - status.updatedAt) / 1_000)) : shown?.line ?? null;
+  const announced = counting ? nudging ? LINE.nudging : countdownLine(Math.ceil((status.sendAt! - status.updatedAt) / 1_000), status.checkIn) : shown?.line ?? null;
   // `data-lg-dock-ui`: Liquid Glass (community plugin) folds composer cards into tap-to-open pills on phones.
   // This line is the composer's own status, not a card, so it uses Liquid Glass's own-UI marker to stay in place.
   return <div className="nudger-cb" data-state={counting ? "countdown" : status.state} data-lg-dock-ui="">

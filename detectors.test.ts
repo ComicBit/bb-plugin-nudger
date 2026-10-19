@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createJevDetector, jevBlockerFacts, routeJevAnswers, runShadowComparison } from "./detectors.js";
+import { createJevDetector, jevBlockerFacts, jevCheckIn, routeJevAnswers, runShadowComparison } from "./detectors.js";
 import { JEV_NO_CREDITS } from "./continuation-copy.js";
 import type { FinalMessageClassifier, FinalMessageJudgment } from "./recovery-contract.js";
 import { RECOVERY_SHADOW_CORPUS } from "./recovery-shadow-corpus.js";
@@ -58,6 +58,39 @@ test("an ending reporting a state the operator chose is settled: not an obstacle
   // Below the confidence floor, or a real request, the obstacle reading stands.
   assert.equal(routeJevAnswers({ obstacle, boundary, ending: ending("operator_chosen", 0.5) }).classification, "uncertainty");
   assert.equal(routeJevAnswers({ obstacle, boundary, ending: ending("request", 0.9) }).classification, "uncertainty");
+});
+
+test("a nudge now needs Jev to name the assistant itself as next, and never follows an ending that asks the operator", () => {
+  const obstacle = { type: "choice" as const, choice: "none" as const, confidence: 1, probabilities: { none: 1, blocker: 0, permission: 0, uncertainty: 0 } };
+  const boundary = { type: "choice" as const, choice: "continue" as const, confidence: 0.95, probabilities: { continue: 0.95, finished: 0.03, uncertainty: 0.02 } };
+  const report = { type: "choice" as const, choice: "report" as const, confidence: 1, probabilities: { request: 0, operator_chosen: 0, report: 1 } };
+  const waitsOn = (choice: "assistant" | "running" | "operator" | "nothing", confidence: number) => ({ type: "choice" as const, choice, confidence, probabilities: { assistant: 0, running: 0, operator: 0, nothing: 0, [choice]: confidence } });
+  const nudge = routeJevAnswers({ obstacle, boundary, ending: report, waits_on: waitsOn("assistant", 0.7) });
+  assert.deepEqual(nudge, { classification: "continue", confidence: 0.7 });
+  assert.equal(jevCheckIn({ classification: nudge.classification, questions: { waits_on: waitsOn("assistant", 0.7) } }), false);
+  // Without waits_on, or when Jev cannot tell who is next, the ending is reported rather than nudged.
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: report }).classification, "uncertainty");
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: report, waits_on: waitsOn("assistant", 0.5) }).classification, "uncertainty");
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: report, waits_on: waitsOn("operator", 0.9) }).classification, "uncertainty");
+  // "Please send each bot one message, then fill in the form so I can pass your answers on."
+  const request = { ...report, choice: "request" as const, probabilities: { request: 1, operator_chosen: 0, report: 0 } };
+  assert.equal(routeJevAnswers({ obstacle, boundary, ending: request, waits_on: waitsOn("assistant", 0.97) }).classification, "uncertainty");
+});
+
+test("work running in a delegated thread or task gets a late check-in; a named obstacle or an operator request still reports", () => {
+  const none = { type: "choice" as const, choice: "none" as const, confidence: 0.8, probabilities: { none: 0.8, blocker: 0.1, permission: 0.05, uncertainty: 0.05 } };
+  const boundary = { type: "choice" as const, choice: "continue" as const, confidence: 0.7, probabilities: { continue: 0.7, finished: 0.1, uncertainty: 0.2 } };
+  const report = { type: "choice" as const, choice: "report" as const, confidence: 1, probabilities: { request: 0, operator_chosen: 0, report: 1 } };
+  const running = { type: "choice" as const, choice: "running" as const, confidence: 0.9, probabilities: { assistant: 0.05, running: 0.9, operator: 0.05, nothing: 0 } };
+  // "The change is with fixture-delegated-thread. I'll write once it's done."
+  const checkIn = routeJevAnswers({ obstacle: none, boundary, ending: report, waits_on: running });
+  assert.deepEqual(checkIn, { classification: "continue", confidence: 0.8 });
+  assert.equal(jevCheckIn({ classification: checkIn.classification, questions: { waits_on: running } }), true);
+  assert.equal(routeJevAnswers({ obstacle: none, boundary, ending: report, waits_on: { ...running, confidence: 0.5 } }).classification, "uncertainty");
+  const blocker = { ...none, choice: "blocker" as const, confidence: 0.9 };
+  assert.equal(routeJevAnswers({ obstacle: blocker, boundary, ending: report, waits_on: running }).classification, "blocker");
+  const request = { ...report, choice: "request" as const, probabilities: { request: 1, operator_chosen: 0, report: 0 } };
+  assert.equal(routeJevAnswers({ obstacle: none, boundary, ending: request, waits_on: running }).classification, "uncertainty");
 });
 
 test("the detector keeps ending and consequence answers, which become blocker facts; older judgments have none", async () => {

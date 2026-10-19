@@ -1,5 +1,6 @@
 import type { Nudge } from "./continuation.js";
 import { cancelledCopy, isNoCreditsError, LINE, type Line, suppressedCopy, withheldCopy, workflowLine } from "./continuation-copy.js";
+import { GATE } from "./decision-log.js";
 import type { RecoveryInventoryThread, RecoveryRecord, RecoveryThreadState } from "./recovery-contract.js";
 
 /**
@@ -15,6 +16,8 @@ export interface ContinuationStatus {
   sendAt: number | null;
   /** Full delay the countdown drains over; set only for `countdown`. */
   totalMs: number | null;
+  /** The countdown is a check-in on a thread waiting for work it started, not a nudge to an agent that stopped. */
+  checkIn: boolean;
   /** Primary operator copy; null for `hidden`, `off` and `countdown` (whose line the banner derives from the remaining time). */
   text: string | null;
   /** Quieter secondary copy following `text`; null when there is none. */
@@ -46,7 +49,7 @@ const HISTORY_EXCLUSION = "Live root-turn identity unavailable";
 export function continuationStatus(input: ContinuationStatusInput): ContinuationStatus {
   const { recovery } = input;
   const thread = recovery?.thread ?? null;
-  const quiet = { sendAt: null, totalMs: null, text: null, detail: null, updatedAt: input.now, nudgeCount: input.nudgeCount };
+  const quiet = { sendAt: null, totalMs: null, checkIn: false, text: null, detail: null, updatedAt: input.now, nudgeCount: input.nudgeCount };
   // Exclusions other than Stop and unreadable history mean the thread is never a continuation candidate.
   if (input.ownThread || !recovery || !thread
     || (thread.exclusion !== null && !thread.exclusion.startsWith(STOP_EXCLUSION) && !thread.exclusion.startsWith(HISTORY_EXCLUSION))) {
@@ -55,10 +58,12 @@ export function continuationStatus(input: ContinuationStatusInput): Continuation
   if (!input.enabled) return { state: "off", ...quiet };
   const nudge = input.nudge?.threadId === input.threadId ? input.nudge : null;
   if (nudge?.state === "pending") {
-    return { state: "countdown", sendAt: nudge.sendAt, totalMs: nudge.sendAt - nudge.createdAt, text: null, detail: null, updatedAt: input.now, nudgeCount: input.nudgeCount };
+    const record = recovery.latestRecord;
+    const checkIn = record?.gate === GATE.checkIn && record.runId === nudge.runId && record.messageId === nudge.messageId;
+    return { ...quiet, state: "countdown", sendAt: nudge.sendAt, totalMs: nudge.sendAt - nudge.createdAt, checkIn };
   }
   const [state, { text, detail }] = outcome(recovery, thread, nudge);
-  return { state, sendAt: null, totalMs: null, text, detail, updatedAt: input.now, nudgeCount: input.nudgeCount };
+  return { ...quiet, state, text, detail };
 }
 
 type Outcome = [state: Exclude<ContinuationState, "hidden" | "off" | "countdown">, line: Line];

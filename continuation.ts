@@ -7,6 +7,13 @@ import { RECOVERY_NUDGE, type RecoveryCursor, type RecoveryRecord } from "./reco
 import { LEGACY_DATA_PREFIX, LEGACY_SENT_KEY, retainedKeys, retainedValue } from "./migration-storage.js";
 
 export const NUDGE_DELAY_MS = 20_000;
+/**
+ * A thread waiting on work it started is woken by that work: on 2026-10-12..19, half of those waits were woken within
+ * 4.4 minutes and 75% within 13. A check-in fires only when nothing has reached the thread for this long.
+ */
+export const CHECK_IN_MS = 30 * 60_000;
+/** Nudges in a row that drew no other message before Nudger stops nudging the thread; a check-in delay doubles with each. */
+export const NUDGE_STREAK_LIMIT = 3;
 const LOG_LIMIT = 200;
 /** The log is diagnostic: one write per burst (a schedule and its send 20s later), at most this late. */
 export const LOG_FLUSH_MS = 30_000;
@@ -60,16 +67,18 @@ export interface Continuation {
   /** Persists the thread's toggle; turning it off cancels its pending nudge. */
   setEnabled(threadId: string, enabled: boolean): Promise<void>;
   /**
-   * Schedules RECOVERY_NUDGE for a classified 'continue' ending; a per-thread plugin timer sends it after the delay.
-   * A thread that is off (or a global pause) yields an already-cancelled nudge.
+   * Schedules RECOVERY_NUDGE for a classified 'continue' ending; a per-thread plugin timer sends it after `delayMs`
+   * (the service's delay by default). A thread that is off (or a global pause) yields an already-cancelled nudge.
    */
-  schedule(record: RecoveryRecord): Promise<Nudge>;
+  schedule(record: RecoveryRecord, delayMs?: number): Promise<Nudge>;
   /** Cancels the thread's pending nudge (Stop evidence, the countdown Cancel); a no-op when none is pending. */
   cancel(threadId: string, reason: string): void;
   /** Cancels every pending nudge (global pause). */
   cancelAll(reason: string): void;
   /** How many nudges this thread has received; survives restarts and the log's size limit. */
   sentCount(threadId: string): number;
+  /** Nudges sent to the thread in a row with no other message reaching it in between; this process only. */
+  streak(threadId: string): number;
   /** The thread's most recent nudge in any state. */
   latest(threadId: string): Nudge | null;
   /** Synchronous dispatch-hook decision; null means no opinion. */
@@ -143,6 +152,8 @@ export function createContinuation(options: ContinuationOptions): Continuation {
   /** Nudges each thread received; sends before loading are added to the stored counts. */
   const sentCounts = new Map<string, number>();
   const inheritedCounts = new Map<string, number>();
+  /** Nudges sent since anything else last reached each thread. */
+  const streaks = new Map<string, number>();
   let loaded = false;
   let disposed = false;
   let writes: Promise<unknown> = Promise.resolve();
@@ -200,6 +211,7 @@ export function createContinuation(options: ContinuationOptions): Continuation {
     const next = Math.max(0, (sentCounts.get(threadId) ?? 0) + delta);
     if (next === 0) sentCounts.delete(threadId);
     else sentCounts.set(threadId, next);
+    streaks.set(threadId, Math.max(0, (streaks.get(threadId) ?? 0) + delta));
     if (!loaded) return;
     const counts = ownCounts();
     write(() => kv.set(SENT_KEY, counts));
@@ -258,6 +270,8 @@ export function createContinuation(options: ContinuationOptions): Continuation {
       return pending ? withhold(pending, reason) : reject(reason);
     }
     if (pending) transition(pending, "cancelled", `${CANCEL_REASON.freshActivity}: ${context.initiator}`);
+    // Anything else reaching the thread (the operator, another thread, a finished child or task) answers the streak.
+    streaks.delete(context.thread.id);
     return null;
   }
   async function send(nudge: Nudge): Promise<void> {
@@ -346,16 +360,16 @@ export function createContinuation(options: ContinuationOptions): Continuation {
       options.onChange?.(threadId);
       await writes;
     },
-    async schedule(record) {
+    async schedule(record, delay = delayMs) {
       cancelPending(record.threadId, CANCEL_REASON.superseded);
       const createdAt = now();
       const nudge: Nudge = { nudgeId: randomUUID(), threadId: record.threadId, runId: record.runId, messageId: record.messageId,
-        messageRevision: record.messageRevision, sendAt: createdAt + delayMs, createdAt, state: "pending", cancelReason: null };
+        messageRevision: record.messageRevision, sendAt: createdAt + delay, createdAt, state: "pending", cancelReason: null };
       nudges.set(record.threadId, nudge);
       transition(nudge, "scheduled", SCHEDULED_REASON);
       if (!enabled(record.threadId)) transition(nudge, "cancelled", CANCEL_REASON.turnedOff);
       else if (options.paused?.()) transition(nudge, "cancelled", CANCEL_REASON.paused);
-      else if (!disposed) timers.set(record.threadId, setTimer(() => fire(nudge), delayMs));
+      else if (!disposed) timers.set(record.threadId, setTimer(() => fire(nudge), delay));
       return { ...nudge };
     },
     cancel: cancelPending,
@@ -367,6 +381,7 @@ export function createContinuation(options: ContinuationOptions): Continuation {
       return nudge ? { ...nudge } : null;
     },
     sentCount: threadId => sentCounts.get(threadId) ?? 0,
+    streak: threadId => streaks.get(threadId) ?? 0,
     decide(context) {
       dispatching = {
         attempt: context.attempt, initiator: context.initiator, submission: context.experimental_submission !== null,

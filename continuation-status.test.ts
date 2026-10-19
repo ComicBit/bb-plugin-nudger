@@ -29,15 +29,18 @@ function input(options: Case = {}): ContinuationStatusInput {
 const copy = (options: Case) => { const { text, detail } = continuationStatus(input(options)); return [text, detail]; };
 const running = inventory({ status: "active", watched: true });
 
-test("a pending nudge is a countdown over the full delay", () => {
+test("a pending nudge is a countdown over the full delay; a scheduled check-in is marked as one", () => {
   assert.deepEqual(continuationStatus(input({ record: ending(), nudge: nudged() })),
-    { state: "countdown", sendAt: 41_000, totalMs: 20_000, text: null, detail: null, updatedAt: NOW, nudgeCount: 0 });
-  assert.deepEqual(countdownLine(12), { text: "Continuing in 12s", detail: "The agent stopped before finishing" });
+    { state: "countdown", sendAt: 41_000, totalMs: 20_000, checkIn: false, text: null, detail: null, updatedAt: NOW, nudgeCount: 0 });
+  assert.equal(continuationStatus(input({ record: ending({ gate: "check-in-scheduled" }), nudge: nudged() })).checkIn, true);
+  // A check-in gate on an older run says nothing about this nudge.
+  assert.equal(continuationStatus(input({ record: ending({ gate: "check-in-scheduled", runId: "run-0" }), nudge: nudged() })).checkIn, false);
+  assert.deepEqual(countdownLine(12, false), { text: "Continuing in 12s", detail: "The agent stopped before finishing" });
 });
 
 test("a thread turned off shows only its toggle, even mid-countdown", () => {
   assert.deepEqual(continuationStatus(input({ enabled: false, record: ending(), nudge: nudged(), nudgeCount: 3 })),
-    { state: "off", sendAt: null, totalMs: null, text: null, detail: null, updatedAt: NOW, nudgeCount: 3 });
+    { state: "off", sendAt: null, totalMs: null, checkIn: false, text: null, detail: null, updatedAt: NOW, nudgeCount: 3 });
   assert.equal(continuationStatus(input({ enabled: false, thread: inventory({ exclusion: "Observed manual Stop; waits for your next message to re-arm" }) })).state, "off");
 });
 
@@ -82,7 +85,7 @@ test("the dispatch reject message carries the plain withheld reason", () => {
 
 test("a thread waiting on its workflow or compacting says so, and its held endings never read as a new run or the last second", () => {
   assert.deepEqual(continuationStatus(input({ workflow: { running: 1, settlingUntil: null } })),
-    { state: "waiting", sendAt: null, totalMs: null, text: "Waiting for its workflow", detail: "1 step running", updatedAt: NOW, nudgeCount: 0 });
+    { state: "waiting", sendAt: null, totalMs: null, checkIn: false, text: "Waiting for its workflow", detail: "1 step running", updatedAt: NOW, nudgeCount: 0 });
   const held = ending({ classification: null, action: "suppressed", reason: HELD_REASON.workflow });
   assert.deepEqual(copy({ workflow: { running: 3, settlingUntil: null }, record: held }), ["Waiting for its workflow", "3 steps running"]);
   assert.deepEqual(copy({ workflow: { running: 0, settlingUntil: NOW + 60_000 }, record: held }), ["Waiting for its workflow", "Finishing up"]);
@@ -94,7 +97,7 @@ test("a thread waiting on its workflow or compacting says so, and its held endin
 
   const compactingHeld = ending({ classification: null, action: "suppressed", reason: HELD_REASON.maintenance });
   assert.deepEqual(continuationStatus(input({ thread: running, compacting: true, record: compactingHeld })),
-    { state: "waiting", sendAt: null, totalMs: null, text: "Compacting the conversation", detail: "I'll check the last reply after", updatedAt: NOW, nudgeCount: 0 });
+    { state: "waiting", sendAt: null, totalMs: null, checkIn: false, text: "Compacting the conversation", detail: "I'll check the last reply after", updatedAt: NOW, nudgeCount: 0 });
   assert.deepEqual(copy({ thread: running, compacting: true, classifying: false }), ["Can't follow this run", "It won't be nudged"]);
 
   // After the wait, an ending that was never judged again says why no nudge went out.
@@ -110,7 +113,7 @@ test("a thread waiting on its workflow or compacting says so, and its held endin
 const LEGACY_REASON = "Live public root-turn ending observed; Published @get-bb/plugin-sdk 0.6.15 has no execution-bound continuation admission coordinated with native Stop, queue precedence and accepted-fresh-user provenance, or universal provider completion interception. Automatic recovery cannot be enabled or verified; ordinary threads.send is not a safe substitute.";
 
 test("a legacy or unrecognized ending is watched again, never 'changed at the last second'", () => {
-  const watching = { state: "watching", sendAt: null, totalMs: null, text: "Watching", detail: "I'll check the next reply", updatedAt: NOW, nudgeCount: 0 };
+  const watching = { state: "watching", sendAt: null, totalMs: null, checkIn: false, text: "Watching", detail: "I'll check the next reply", updatedAt: NOW, nudgeCount: 0 };
   assert.deepEqual(continuationStatus(input({ record: ending({ classification: null, action: "suppressed", reason: LEGACY_REASON }) })), watching);
   assert.deepEqual(continuationStatus(input({ record: ending({ classification: null, action: "suppressed", reason: "some future suppression reason" }) })), watching);
   assert.deepEqual(continuationStatus(input({ record: ending({ classification: "continue", action: "observed", reason: LEGACY_REASON }) })), watching);

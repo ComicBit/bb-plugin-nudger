@@ -4,7 +4,7 @@ import { RECOVERY_NUDGE, type FinalMessageClassifier, type FinalMessageJudgment,
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { createRecoveryService } from "./recovery.js";
 import { DECISION_LIMITS, historyRecordIds, OUTCOME_WINDOW_MS } from "./decision-log.js";
-import { createContinuation, SCHEDULED_REASON, type Continuation } from "./continuation.js";
+import { CHECK_IN_MS, createContinuation, NUDGE_STREAK_LIMIT, SCHEDULED_REASON, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, HELD_REASON, WITHHELD_REASON } from "./continuation-copy.js";
 import { WORKFLOW_SETTLE_MS } from "./workflow-steps.js";
 
@@ -945,6 +945,32 @@ test("a nudge's text and fate are kept on its decision, and the operator cancell
     { text: RECOVERY_NUDGE, state: "cancelled", gate: "operator-cancel", reason: CANCEL_REASON.countdown });
   assert.equal(decision.outcome?.kind, "cancelled"); assert.equal(decision.outcome?.reason, CANCEL_REASON.countdown);
   await h.continuation!.dispose();
+});
+
+test("an ending waiting on work it started gets a late check-in; after unanswered nudges the next ending is not nudged", async t => {
+  const waiting: FinalMessageJudgment = { ...judgment("continue"), questions: { waits_on: { choice: "running", confidence: 1, probabilities: { assistant: 0, running: 1, operator: 0, nothing: 0 } } } };
+  const h = fixture(1, async () => waiting, true); t.after(() => { h.continuation!.dispose(); return h.service.dispose(); });
+  await h.continuation!.start(); await h.service.start();
+  const thread = h.threads[0]!;
+  await h.finish(0, "The suite runs as a background task; I'll check the results when it finishes.");
+  const first = await h.waitForRecord(thread.id, "nudged");
+  const gate = async (runId: string) => (await h.service.decisions({ cursor: null })).decisions.find(row => row.runId === runId)?.gate;
+  assert.equal(await gate("run-thread-0"), "check-in-scheduled");
+  const checkIn = h.continuation!.latest(thread.id)!;
+  assert.equal(checkIn.sendAt - checkIn.createdAt, CHECK_IN_MS);
+  // The thread's nudges are admitted one after another, with nothing else reaching it in between.
+  for (let sent = 0; sent < NUDGE_STREAK_LIMIT; sent++) {
+    const nudge = sent === 0 ? checkIn : await h.continuation!.schedule(first);
+    h.continuation!.decide(makeMessageDispatchHookContext({ thread: { id: thread.id, status: "idle" }, initiator: "user", input: { text: RECOVERY_NUDGE },
+      experimental_submission: { pluginId: h.bb.pluginId, data: { continuationNudge: nudge.nudgeId } } }));
+  }
+  const seq = Math.max(...h.history.get(thread.id)!.map(row => row.seq));
+  h.history.get(thread.id)!.push(turn(thread.id, "run-2", seq + 1), message(thread.id, "run-2", seq + 2, "Still running."), turn(thread.id, "run-2", seq + 3, true));
+  thread.updatedAt++;
+  await h.harness.emitThreadEvent("thread.idle", { thread, lastAssistantText: null });
+  await h.until(() => h.service.records().some(row => row.runId === "run-2" && row.action === "suppressed"));
+  assert.equal(await gate("run-2"), "nudge-streak");
+  assert.equal(h.continuation!.latest(thread.id)!.runId, "run-thread-0");
 });
 
 test("a wrong label persists with its decision across restarts until cleared, and pages are stable and complete", async t => {

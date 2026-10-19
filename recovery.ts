@@ -1,13 +1,13 @@
 import { z } from "zod";
 import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk";
-import { SCHEDULED_REASON, type Continuation } from "./continuation.js";
-import { CANCEL_REASON, HELD_REASON, isNoCreditsError, WITHHELD_REASON } from "./continuation-copy.js";
+import { CHECK_IN_MS, NUDGE_STREAK_LIMIT, SCHEDULED_REASON, type Continuation } from "./continuation.js";
+import { CANCEL_REASON, HELD_REASON, isNoCreditsError, NUDGE_STREAK_REASON, WITHHELD_REASON } from "./continuation-copy.js";
 import { RECOVERY_NUDGE, type FinalMessageClassifier, type RecoveryBlocker, type RecoveryCursor, type RecoveryInventoryProject, type RecoveryInventoryThread, type RecoveryNudgeDecision, type RecoveryRecord, type RecoveryService, type RecoveryStatus, type RecoveryThreadState, type RecoveryWorkflowWait, type ThreadEventRow } from "./recovery-contract.js";
 import { createKvWriter } from "./kv-writer.js";
 import { WORKFLOW_SETTLE_MS, workflowOwner, workflowStepRunning } from "./workflow-steps.js";
 import { LEGACY_DATA_PREFIX, retainedKeys, retainedValue } from "./migration-storage.js";
 import { DECISION_LIMITS, decisionCursor, decisionsAfter, decodeText, encodeText, GATE, historyRecord, historyRecordIds, noneOutcome, nudgeGate, operatorCancelled, OUTCOME_WINDOW_MS, planRetention, RECORD_KEY, TEXT_KEY, toDecision } from "./decision-log.js";
-import { jevBlockerFacts } from "./detectors.js";
+import { jevBlockerFacts, jevCheckIn } from "./detectors.js";
 import { PAGE_BYTES } from "./publication.js";
 type ThreadResponse = PluginThreadEventPayloads["thread.idle"]["thread"];
 
@@ -59,7 +59,7 @@ export interface RecoveryServiceOptions {
   reportBlocker(blocker: RecoveryBlocker): Promise<void>;
   onChange?(): void;
   /** Automatic continuation: classified 'continue' endings of threads it has on are scheduled; others are recorded as suppressed. */
-  continuation?: Pick<Continuation, "enabled" | "schedule" | "cancel" | "latest">;
+  continuation?: Pick<Continuation, "enabled" | "schedule" | "cancel" | "latest" | "streak">;
 }
 
 const classificationSchema = z.enum(["continue", "finished", "blocker", "permission", "uncertainty"]);
@@ -527,11 +527,14 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
             return null;
           }
           const nextRecord: RecoveryRecord = { ...record, classification: judgment.classification, judgment };
+          const checkIn = jevCheckIn(judgment);
+          const streak = options.continuation?.streak(record.threadId) ?? 0;
           if (judgment.classification === "continue" && options.continuation?.enabled(record.threadId)) {
             // Workflow release may reuse this judgment, but admission and the nudge are always fresh.
             const held = holdReason(record.threadId);
             if (held) decide(nextRecord, "suppressed", HELD_GATE[held]!, held);
-            else decide(nextRecord, "nudged", GATE.nudge, SCHEDULED_REASON);
+            else if (streak >= NUDGE_STREAK_LIMIT) decide(nextRecord, "suppressed", GATE.nudgeStreak, NUDGE_STREAK_REASON);
+            else decide(nextRecord, "nudged", checkIn ? GATE.checkIn : GATE.nudge, SCHEDULED_REASON);
           } else if (judgment.classification === "continue") {
             decide(nextRecord, "suppressed", GATE.autoContinueOff, "Continuation candidate classified, but auto-continue is off for this thread");
           } else if (judgment.classification === "finished") {
@@ -548,7 +551,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
           successfulJudgments.set(record, judgment);
           changed();
           if (record.action === "nudged") {
-            const nudge = await options.continuation!.schedule(record);
+            const nudge = await options.continuation!.schedule(record, checkIn ? CHECK_IN_MS * 2 ** streak : undefined);
             noteNudge(record.threadId);
             if (nudge.state === "cancelled" || nudge.state === "withheld") {
               decide(record, "suppressed", nudgeGate(nudge.state, nudge.cancelReason)!, `Continuation ${nudge.state}: ${nudge.cancelReason ?? "no reason recorded"}`);

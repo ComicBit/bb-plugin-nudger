@@ -39,6 +39,7 @@ export const LINE = {
   compacting: line("Compacting the conversation", "I'll check the last reply after"),
   compacted: line("The conversation was compacted", NOT_SENT),
   workflowRan: line("Its workflow was running", NOT_SENT),
+  streak: line("Stopped nudging", "Its last nudges drew nothing new; any new message resumes"),
 } as const satisfies Record<string, Line>;
 
 /** The thread waits on the workflow it started: its steps, then a short settle before its last reply is checked. */
@@ -46,8 +47,10 @@ export function workflowLine(running: number): Line {
   return line("Waiting for its workflow", running === 0 ? "Finishing up" : running === 1 ? "1 step running" : `${running} steps running`);
 }
 
-export function countdownLine(seconds: number): Line {
-  return line(`Continuing in ${seconds}s`, "The agent stopped before finishing");
+/** A nudge counts down in seconds; a check-in (the agent waits on work it started) in minutes. */
+export function countdownLine(seconds: number, checkIn: boolean): Line {
+  if (!checkIn) return line(`Continuing in ${seconds}s`, "The agent stopped before finishing");
+  return line(`Checking in in ${Math.ceil(seconds / 60)}m`, "Unless the work it's waiting on reports back first");
 }
 
 /** A line as one sentence pair, for places with a single text slot. */
@@ -105,6 +108,9 @@ export const HELD_REASON = {
   maintenance: "Held while the conversation compacts; the ending is checked after",
 } as const;
 
+/** Recovery's reason for not nudging a thread whose last NUDGE_STREAK_LIMIT nudges drew no other message. */
+export const NUDGE_STREAK_REASON = "Nudges in a row drew no other message; nothing more is sent until something else reaches the thread";
+
 export function cancelledCopy(reason: string | null): Line {
   if (reason === `${CANCEL_REASON.freshActivity}: user`) return LINE.replied;
   if (reason?.startsWith(CANCEL_REASON.freshActivity)) return LINE.movedOn;
@@ -140,6 +146,7 @@ const SUPPRESSED: Array<[prefix: string, copy: Line]> = [
   ["Classification routing canceled by newer", LINE.movedOn],
   [HELD_REASON.workflow, LINE.workflowRan],
   [HELD_REASON.maintenance, LINE.compacted],
+  [NUDGE_STREAK_REASON, LINE.streak],
   // The reply ended unread or while auto-continue was off; the thread is watched again now.
   ["Continuation candidate classified, but", LINE.watchingNext],
   ["Passive classification paused", LINE.watchingNext],

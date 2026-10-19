@@ -19,7 +19,7 @@ export class RecoveryVerificationPrerequisiteError extends Error {
 }
 
 function requireComparison(comparison: ShadowComparison | null, detectorId: string): ShadowComparison {
-  if (!comparison || comparison.mode !== "synthetic-shadow" || comparison.automaticRecoveryEnabled !== false || comparison.corpusVersion !== "2026-10-07" || !Number.isFinite(comparison.startedAt) || !Number.isFinite(comparison.completedAt) || comparison.startedAt <= 0 || comparison.completedAt < comparison.startedAt || comparison.completedAt > Date.now()) {
+  if (!comparison || comparison.mode !== "synthetic-shadow" || comparison.automaticRecoveryEnabled !== false || comparison.corpusVersion !== "2026-10-19" || !Number.isFinite(comparison.startedAt) || !Number.isFinite(comparison.completedAt) || comparison.startedAt <= 0 || comparison.completedAt < comparison.startedAt || comparison.completedAt > Date.now()) {
     throw new RecoveryVerificationPrerequisiteError("Run the backend-owned synthetic Jev validation before validating the selected detector. Comparison validation never calls a model and does not verify recovery safety.");
   }
   const detectorIds = new Set(comparison.summaries.map(summary => summary.detectorId));

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry } from "@get-bb/plugin-sdk/testing";
-import { ADMITTED_REASON, createContinuation, SCHEDULED_REASON, type Continuation } from "./continuation.js";
+import { ADMITTED_REASON, CHECK_IN_MS, createContinuation, SCHEDULED_REASON, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, WITHHELD_REASON } from "./continuation-copy.js";
 import { RECOVERY_NUDGE, type RecoveryCursor, type RecoveryRecord } from "./recovery-contract.js";
 
@@ -18,7 +18,7 @@ function fixture() {
   const cursors = new Map<string, RecoveryCursor>([[threadId, freshCursor()], [otherId, freshCursor()]]);
   const sends: Array<{ threadId: string; pluginSubmission?: unknown; mode?: string; input?: unknown }> = [];
   const deletes: string[] = [];
-  const timers = new Map<number, { threadId: string | null; callback: () => void }>();
+  const timers = new Map<number, { threadId: string | null; callback: () => void; ms: number }>();
   let nextTimer = 0;
   const core = { status: "idle" as "idle" | "active", delivery: "sent" as "sent" | "queued", paused: false };
   const changes: string[] = [];
@@ -38,7 +38,7 @@ function fixture() {
   // Timers remember which thread scheduled them (the last scheduled record), so tests can fire one thread's timer.
   let scheduling: string | null = null;
   const make = () => createContinuation({ bb, cursor: id => cursors.get(id) ?? null, paused: () => core.paused, now: () => clock,
-    setTimer: (callback, ms) => { assert.equal(ms, 20_000); const id = ++nextTimer; timers.set(id, { threadId: scheduling, callback }); return id; },
+    setTimer: (callback, ms) => { const id = ++nextTimer; timers.set(id, { threadId: scheduling, callback, ms }); return id; },
     clearTimer: handle => { timers.delete(handle as number); }, onChange: id => { changes.push(id); } });
   let continuation: Continuation = make();
   /** Fires every pending timer (or only one thread's) as if the delay elapsed, then waits for the resulting sends. */
@@ -51,9 +51,9 @@ function fixture() {
     }
     await continuation.flush();
   }
-  async function schedule(id = threadId) {
+  async function schedule(id = threadId, delayMs?: number) {
     scheduling = id;
-    try { return await continuation.schedule(ending(id)); } finally { scheduling = null; }
+    try { return await continuation.schedule(ending(id), delayMs); } finally { scheduling = null; }
   }
   return { bb, harness, cursors, sends, deletes, timers, core, changes, elapse, schedule,
     get continuation() { return continuation; },
@@ -92,6 +92,21 @@ test("a continue ending schedules; nothing is sent before the delay, then one st
   assert.deepEqual(send.pluginSubmission, { pluginId: h.bb.pluginId, data: { continuationNudge: nudge.nudgeId } });
   assert.deepEqual(send.input, [{ type: "text", text: RECOVERY_NUDGE, mentions: [] }]);
   assert.deepEqual(reasons(h.continuation), [SCHEDULED, ["sent", ADMITTED_REASON]]);
+});
+
+test("a check-in waits its own delay, and nudges sent with nothing else reaching the thread count as a streak", async () => {
+  const h = await started();
+  const checkIn = await h.schedule(threadId, CHECK_IN_MS);
+  assert.equal(checkIn.sendAt - checkIn.createdAt, CHECK_IN_MS);
+  assert.deepEqual([...h.timers.values()].map(timer => timer.ms), [CHECK_IN_MS]);
+  await h.elapse();
+  await h.schedule();
+  await h.elapse();
+  assert.equal(h.continuation.streak(threadId), 2);
+  assert.equal(h.continuation.streak(otherId), 0);
+  // Anything else reaching the thread (here a finished child) answers the streak.
+  assert.equal(h.continuation.decide(makeMessageDispatchHookContext({ thread: { id: threadId, status: "idle" }, initiator: "system" })), null);
+  assert.equal(h.continuation.streak(threadId), 0);
 });
 
 test("two threads are nudged independently, each on its own timer", async () => {

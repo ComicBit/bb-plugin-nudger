@@ -54,6 +54,10 @@ export const GATE = {
   stale: "stale-ending",
   autoContinueOff: "auto-continue-off",
   nudge: "nudge-scheduled",
+  /** The ending waits on work it started: a late check-in, cancelled by anything reaching the thread first. */
+  checkIn: "check-in-scheduled",
+  /** NUDGE_STREAK_LIMIT nudges in a row drew no other message; nothing more is sent until something else arrives. */
+  nudgeStreak: "nudge-streak",
   finished: "finished",
   obstacle: "obstacle",
   reported: "obstacle-reported",

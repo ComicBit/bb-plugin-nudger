@@ -6,7 +6,8 @@ export interface ShadowCase {
   finalAssistantMessage: string;
   expected: RecoveryClassification;
   stopped: boolean;
-  policyAction: "nudge" | "nothing" | "report" | "suppress";
+  /** `check-in`: a continuation for work the assistant started that is still running, sent late unless it reports back first. */
+  policyAction: "nudge" | "check-in" | "nothing" | "report" | "suppress";
   rationale: string;
 }
 
@@ -208,5 +209,32 @@ export const RECOVERY_SHADOW_CORPUS: readonly ShadowCase[] = [
     stopped: false,
     policyAction: "nudge",
     rationale: "A distinct ending is eligible even when its text resembles an earlier ending.",
+  },
+  {
+    id: "delegated-thread-wait",
+    source: "synthetic",
+    finalAssistantMessage: "I handed the remaining migration to a new thread, which is working on it now. It reports back here when it finishes, and I'll verify the result then.",
+    expected: "continue",
+    stopped: false,
+    policyAction: "check-in",
+    rationale: "Work runs in a delegated thread that wakes this one; nudging now only makes it poll.",
+  },
+  {
+    id: "background-task-wait",
+    source: "synthetic",
+    finalAssistantMessage: "The full regression suite is running as a background task. I'll check the results when it finishes and fix anything it finds.",
+    expected: "continue",
+    stopped: false,
+    policyAction: "check-in",
+    rationale: "A running task reports back by itself; only a late check-in is due.",
+  },
+  {
+    id: "operator-action-request",
+    source: "synthetic",
+    finalAssistantMessage: "The fix is ready for its end-to-end check. Please send each bot one test message, then fill in the form below so I can pass your answers on.",
+    expected: "uncertainty",
+    stopped: false,
+    policyAction: "report",
+    rationale: "Remaining work waits on an action only the operator can take; a nudge would answer for them.",
   },
 ];
