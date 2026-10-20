@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { continuationStatus, type ContinuationStatusInput } from "./continuation-status.js";
-import { CANCEL_REASON, countdownLine, HELD_REASON, JEV_NO_CREDITS, LINE, nudgeRejectMessage, waitLine, WITHHELD_REASON } from "./continuation-copy.js";
+import { CANCEL_REASON, countdownLine, HELD_REASON, JEV_KEY_REJECTED, JEV_NO_CREDITS, LINE, nudgeRejectMessage, waitLine, WITHHELD_REASON } from "./continuation-copy.js";
 import type { Nudge } from "./continuation.js";
 import type { RecoveryInventoryThread, RecoveryRecord, RecoveryWait } from "./recovery-contract.js";
 
@@ -67,11 +67,12 @@ test("each internal condition reads as its exact copy", () => {
     ["withheld: queued", { record: ending({ action: "suppressed", reason: `Continuation withheld: ${WITHHELD_REASON.queued}` }) }, ["The agent was busy", "No nudge sent"]],
     ["withheld: stop", { record: ending(), nudge: nudged({ state: "withheld", cancelReason: WITHHELD_REASON.stop }) }, ["You pressed Stop", "No nudge sent"]],
     ["withheld: anything else", { record: ending(), nudge: nudged({ state: "withheld", cancelReason: "recovery is not observing this thread" }) }, ["Something changed at the last second", "No nudge sent"]],
-    ["global pause", { paused: true, classifying: false, thread: running }, ["Auto-continue paused", "Paused for every thread from the dashboard"]],
-    ["no detector", { detectorId: null, classifying: false }, ["Auto-continue isn't set up", "Choose a detector in Nudger settings"]],
+    ["global pause", { paused: true, classifying: false, thread: running }, ["Auto-continue paused", "Paused for every thread in Nudger settings"]],
+    ["no detector", { detectorId: null, classifying: false }, ["Nudger is off", "Turn it on in Nudger settings"]],
     ["classification error", { record: ending({ classification: null, action: "error", reason: "Final-message classification/reporting failed: timeout" }) }, ["Couldn't read the reply", "No nudge sent"]],
     ["out of credits", { record: ending({ classification: null, action: "error", reason: `Final-message classification/reporting failed: ${JEV_NO_CREDITS}` }) }, ["Jev is out of credits", "Add TypeSafe credits; no nudge sent"]],
     ["out of credits (stored before it was named)", { record: ending({ classification: null, action: "error", reason: "Final-message classification/reporting failed: Jev evaluation failed with HTTP 402" }) }, ["Jev is out of credits", "Add TypeSafe credits; no nudge sent"]],
+    ["key rejected", { record: ending({ classification: null, action: "error", reason: `Final-message classification/reporting failed: ${JEV_KEY_REJECTED}` }) }, ["Jev rejected the API key", "Paste a valid key in Nudger settings; no nudge sent"]],
     ["run not followable", { thread: inventory({ exclusion: "Live root-turn identity unavailable in bounded public history" }) }, ["Can't follow this run", "It won't be nudged"]],
     ["idle with no ending yet", { currentRunId: null }, ["Watching", "I'll check the next reply"]],
   ];
@@ -143,7 +144,7 @@ test("no status copy mentions internals", () => {
     copy({ record: ending({ classification: null, action: "observed" }) }), copy({ detectorId: null }),
     copy({ record: ending({ action: "suppressed", reason: "Continuation candidate classified, but auto-continue is off for this thread" }) }),
   ];
-  for (const text of all.map(pair => pair.join(" "))) assert.doesNotMatch(text, /jev|detector(?! in Nudger settings)|classif|cursor|admission|trial/i);
+  for (const text of all.map(pair => pair.join(" "))) assert.doesNotMatch(text, /jev|detector|classif|cursor|admission|trial/i);
 });
 
 test("own, child, hidden, archived and unknown threads render nothing", () => {

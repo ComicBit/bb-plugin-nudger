@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { JEV_NO_CREDITS } from "./continuation-copy.js";
+import { JEV_KEY_REJECTED, JEV_NO_CREDITS } from "./continuation-copy.js";
 import type {
   DetectorUsage,
   FinalMessageClassifier,
@@ -168,6 +168,7 @@ export function createJevDetector(options: {
       });
       // 402 is TypeSafe's billing_error: the organization has no credits left. Every call fails until credits are added.
       if (response.status === 402) throw new Error(JEV_NO_CREDITS);
+      if (response.status === 401 || response.status === 403) throw new Error(JEV_KEY_REJECTED);
       if (!response.ok) throw new Error(`Jev evaluation failed with HTTP ${response.status}`);
       const result = jevResponseSchema.parse(await response.json());
       const { obstacle, boundary, ending, waits_on: waitsOn, consequence } = result.answers;

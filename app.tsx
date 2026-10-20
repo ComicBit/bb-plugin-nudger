@@ -20,6 +20,18 @@ function SettingRow({ label, htmlFor, description, children }: { label: string; 
     </div>
   </div>;
 }
+const KEYS_URL = "https://console.typesafe.ai/keys";
+/** One line about the saved key, and what Nudger is doing with it. */
+function jevStatus(config: Configuration): { headline: string; problem: boolean; detail: ReactNode } {
+  const keysLink = <a className="underline underline-offset-4 hover:text-foreground" href={KEYS_URL} target="_blank" rel="noreferrer">console.typesafe.ai</a>;
+  if (config.key === "missing") return { headline: "No key yet", problem: false, detail: <>Paste your Jev API key above and Nudger turns on. Get one at {keysLink}.</> };
+  if (config.key === "rejected") return { headline: "Key rejected", problem: true, detail: <>Jev didn't accept this key, so Nudger checks nothing. Paste a valid key from {keysLink}.</> };
+  if (config.key === "unreachable") return { headline: "Couldn't check the key", problem: true, detail: `${config.keyDetail ?? "Jev didn't answer"}. Nudger turns on once Jev accepts the key.` };
+  const headline = config.key === "connected" ? "Connected" : "Key saved";
+  if (!config.active) return { headline, problem: false, detail: "Nudger is off: it checks nothing and sends nothing." };
+  if (config.paused) return { headline, problem: false, detail: "Paused: no checks and no nudges until you resume." };
+  return { headline, problem: false, detail: "Nudger is on. Jev reads the last reply of every thread that stops; unfinished work gets a nudge, everything else waits for you." };
+}
 function NudgerSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -45,24 +57,33 @@ function NudgerSettings() {
   useEffect(() => { live.current.mounted = true; return () => { live.current.mounted = false; }; }, []);
   useEffect(() => { void refresh(); }, [refresh, connected]);
   useRealtime("nudger-changed-v1", () => { void refresh(); });
-  const pause = async () => {
-    if (!config || busy) return;
+  const act = async (operation: () => Promise<unknown>, failure: string) => {
+    if (busy) return;
     setBusy(true);
-    try { await rpc.call("nudger_pause_v1", { version: 1, paused: !config.paused }); await refresh(); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not change the pause. Try again."); }
+    try { await operation(); await refresh(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : failure); }
     finally { setBusy(false); }
   };
+  const status = config && jevStatus(config);
   return <section className="space-y-4 text-foreground" aria-busy={busy || !config}>
     {error && <div className="flex items-center gap-3" role="alert"><p className="min-w-0 flex-1 text-xs text-destructive">{error}</p><button type="button" className={BUTTON} onClick={() => { void refresh(); }}>Try again</button></div>}
     {!config && !error && <p className="text-xs text-muted-foreground" role="status">Loading Nudger…</p>}
-    {config && <>
-      <SettingRow label="Classification" description={<>
-        <p role="status" className="tabular-nums">{snapshot ? `${snapshot.status.watchedCount} active executions watched · ${snapshot.status.threads.length} threads visible to the watcher` : "Loading native inventory…"}</p>
-        <p>Pause prevents classification and cancels pending nudges.</p>
+    {config && status && <>
+      <SettingRow label="Jev" description={<>
+        <p role="status" className={`font-medium ${status.problem ? "text-destructive" : "text-foreground"}`}>{status.headline}</p>
+        <p>{status.detail}</p>
       </>}>
-        <button type="button" className={BUTTON} disabled={busy} aria-pressed={config.paused} onClick={() => { void pause(); }}>{config.paused ? "Resume classification" : "Pause classification"}</button>
+        {config.key === "missing" || config.key === "rejected" ? <a className={BUTTON} href={KEYS_URL} target="_blank" rel="noreferrer">Get a key</a>
+          : config.key === "unreachable" ? <button type="button" className={BUTTON} disabled={busy} onClick={() => { void act(() => rpc.call("nudger_settings_set_v1", { version: 1 }), "Could not check the key. Try again."); }}>Check again</button>
+          : !config.active && <button type="button" className={BUTTON} disabled={busy} onClick={() => { void act(() => rpc.call("nudger_settings_set_v1", { version: 1, enabled: true, detector: "jev" }), "Could not turn Nudger on. Try again."); }}>Turn on</button>}
       </SettingRow>
-      {config.error && <p className="text-xs text-destructive" role="status">{config.error}</p>}
+      {config.active && <SettingRow label="Watching" description={<>
+        <p role="status" className="tabular-nums">{snapshot ? `${snapshot.status.watchedCount} running ${snapshot.status.watchedCount === 1 ? "thread" : "threads"} · ${snapshot.status.threads.length} threads in view` : "Loading threads…"}</p>
+        <p>Pause stops every check and cancels pending nudges until you resume.</p>
+      </>}>
+        <button type="button" className={BUTTON} disabled={busy} aria-pressed={config.paused} onClick={() => { void act(() => rpc.call("nudger_pause_v1", { version: 1, paused: !config.paused }), "Could not change the pause. Try again."); }}>{config.paused ? "Resume" : "Pause"}</button>
+      </SettingRow>}
+      {config.error && config.key !== "missing" && config.key !== "rejected" && <p className="text-xs text-destructive" role="status">{config.error}</p>}
     </>}
     {snapshot && snapshot.blockers.length > 0 && <div className="space-y-2 border-t border-border/60 pt-4">
       <h3 className="text-sm font-normal text-foreground">Needs your attention</h3>
@@ -77,7 +98,7 @@ function NudgerSettings() {
   </section>;
 }
 export default definePluginApp(app => {
-  app.slots.settingsSection({ id: "nudger-settings-v1", title: "Watcher and automatic continuation", description: "Live watcher status and the global pause. Stop in a thread suppresses its future endings until your next message; the eye in a thread's composer turns auto-continue off for that thread.", component: NudgerSettings });
+  app.slots.settingsSection({ id: "nudger-settings-v1", title: "Status", description: "What Nudger is doing right now. Stop in a thread holds its nudges until your next message; the eye in a thread's composer turns nudges off for that thread.", component: NudgerSettings });
   app.slots.navPanel({ id: "stats", title: "Nudger", icon: "nudger/hand", path: "stats", component: NudgerStatsPage });
   app.composer.customize({ id: "nudger-continuation-v1", scopes: ["thread"], banners: [{ id: "nudger-continuation-banner-v1", chrome: "bare", component: ContinuationBanner }] });
 });

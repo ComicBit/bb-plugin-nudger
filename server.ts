@@ -4,23 +4,23 @@ import { dirname, join, resolve } from "node:path";
 import { setInterval as every } from "node:timers/promises";
 import type { z } from "zod";
 import { createContinuation, type Continuation } from "./continuation.js";
-import { CANCEL_REASON, nudgeRejectMessage } from "./continuation-copy.js";
+import { CANCEL_REASON, JEV_KEY_REJECTED, nudgeRejectMessage } from "./continuation-copy.js";
 import { continuationStatus, type ContinuationStatus } from "./continuation-status.js";
 import { createRecoveryService } from "./recovery.js";
-import type { RecoveryBlocker, RecoveryRecord, RecoveryService } from "./recovery-contract.js";
+import type { FinalMessageClassifier, RecoveryBlocker, RecoveryRecord, RecoveryService } from "./recovery-contract.js";
 import { createJevDetector, jevBlockerFacts, runShadowComparison, type ShadowComparison } from "./detectors.js";
 import { createUsageLedger, meteredDetector, type UsageLedger } from "./detector-usage.js";
 import { createRecoveryVerifier } from "./verification.js";
 import { createHeadquartersPeer } from "./headquarters.js";
 import { migrateHeadquarters, MIGRATION_KEY } from "./migration.js";
-import { LEGACY_ACTIVATION_KEY, LEGACY_SETTINGS_KEY, retainedValue, type ImportedSettings } from "./migration-storage.js";
+import { LEGACY_ACTIVATION_KEY, retainedValue } from "./migration-storage.js";
+import { checkJevKey, EMPTY_KEY_STATE, KEY_STATE_KEY, keyChecked, keyFingerprint, type KeyState } from "./jev-key.js";
 import { boundedRows, historyPage, historyVersion } from "./publication.js";
 import { rpcContract } from "./rpc-contract.js";
 import { decisionSchema, labelRequestSchema, snapshotSchema } from "./nudger-contract.js";
 import { type NudgerConfiguration } from "./rpc-contract.js";
 import { computeStats } from "./stats.js";
 
-const LUNA_REMOVED = "Luna was removed; select Jev. Enter your TypeSafe key in Nudger settings, then select Jev. Until then Nudger only observes.";
 const DECISIONS_USAGE = "bb nudger decisions [--since <ISO date|epoch ms>] [--out <path>]";
 const LABEL_USAGE = "bb nudger label <recordId> <wrong|clear> [--by <name>] [--note <text>]";
 
@@ -39,12 +39,12 @@ function cliFlags(tokens: readonly string[]): Record<string, string> | null {
 export default function plugin(bb: BbPluginApi) {
   const lifetime = new AbortController();
   const signal = lifetime.signal;
-  // Omitted fields stay distinguishable from explicit values during migration. Effective detector defaults to none.
+  // Saving a new key checks it, then sets `detector` and `enabled` (see configure()); explicit values otherwise stay the operator's.
   const settings = bb.settings.define({
-    enabled: { type: "boolean", label: "Enable automatic continuation", description: "Off keeps passive inventory and banners running without classification or dispatch.", default: true },
-    detector: { type: "select", label: "Detector", options: ["none", "jev"], experimental_optionLabels: { none: "None — observe only", jev: "Jev — TypeSafe API" },
-      description: "None only observes: no model calls, no messages. Jev reads only a new live run's final assistant message. Migration stays passive: select Jev after entering its key." },
-    typesafeApiKey: { type: "string", label: "TypeSafe API key", secret: true, description: "Required for Jev. Never sent to the settings screen; Headquarters' encrypted key is preserved, not copied." },
+    typesafeApiKey: { type: "string", label: "Jev API key", secret: true, description: "Get one at console.typesafe.ai. Saving a new key checks it with Jev and turns Nudger on." },
+    enabled: { type: "boolean", label: "Automatic continuation", description: "Send \"please continue\" when Jev judges that an agent stopped with work left. Off: Nudger checks nothing and sends nothing.", default: true },
+    detector: { type: "select", label: "Judge", options: ["none", "jev"], experimental_optionLabels: { none: "Off", jev: "Jev" }, default: "none",
+      description: "Jev reads only the last reply of a thread that stopped. Saving a key sets this to Jev." },
   });
   const peer = createHeadquartersPeer(bb, signal);
   let recovery: RecoveryService | null = null;
@@ -97,19 +97,57 @@ export default function plugin(bb: BbPluginApi) {
     }
     return cachedHistory;
   }
-  const jev = (key: string) => meteredDetector(createJevDetector({ apiKey: key }), "jev", usage);
-  /** The newest retained ending that was classified came from a removed Luna detector (legacy ids such as `*-codex-gpt-6-luna-*`). */
-  function lastClassifiedByLuna(): boolean {
-    let latest: { observedAt: number; detector: string } | null = null;
-    for (const record of history().records) if (record.detector && (!latest || record.observedAt > latest.observedAt)) latest = { observedAt: record.observedAt, detector: record.detector };
-    return latest?.detector.includes("-luna-") ?? false;
+  /** Jev, metered. Each call's outcome also tells whether Jev still accepts the key. */
+  function jev(key: string): FinalMessageClassifier {
+    const detector = meteredDetector(createJevDetector({ apiKey: key }), "jev", usage);
+    const fingerprint = keyFingerprint(key);
+    return { id: detector.id, async classify(text, options) {
+      try {
+        const judgment = await detector.classify(text, options);
+        noteKeyResult(fingerprint, "connected");
+        return judgment;
+      } catch (cause) {
+        if (cause instanceof Error && cause.message === JEV_KEY_REJECTED) noteKeyResult(fingerprint, "rejected");
+        throw cause;
+      }
+    } };
+  }
+  let notedKeyResult: string | null = null;
+  /** A live call's verdict on the key. A refused key revokes Jev at once, so no further call uses it. */
+  function noteKeyResult(fingerprint: string, result: "connected" | "rejected") {
+    if (signal.aborted || notedKeyResult === `${fingerprint}:${result}`) return;
+    notedKeyResult = `${fingerprint}:${result}`;
+    void serial(async () => {
+      const state = await bb.storage.kv.get<KeyState>(KEY_STATE_KEY) ?? EMPTY_KEY_STATE;
+      if (state.check?.fingerprint === fingerprint && state.check.result === result) return;
+      await bb.storage.kv.set(KEY_STATE_KEY, { ...state, check: { fingerprint, result, at: Date.now(), detail: null } });
+      if (result === "rejected") await configure();
+      changed();
+    }).catch(cause => { if (!signal.aborted) bb.log.warn(`Nudger could not record Jev's answer about the key: ${String(cause)}`); });
   }
   async function configure() {
     const revision = settingsRevision;
     const config = await settings.get();
     if (revision !== settingsRevision) return;
     signal.throwIfAborted();
-    const signature = JSON.stringify([config.enabled, config.detector ?? "none", config.typesafeApiKey ?? ""]);
+    const key = config.typesafeApiKey ?? "";
+    const fingerprint = key ? keyFingerprint(key) : null;
+    let state = await bb.storage.kv.get<KeyState>(KEY_STATE_KEY) ?? EMPTY_KEY_STATE;
+    if (fingerprint && state.pending?.fingerprint === fingerprint) {
+      const checked = keyChecked(state, { fingerprint, at: Date.now(), ...await checkJevKey(key, { signal }) });
+      if (revision !== settingsRevision) return;
+      state = checked.state; notedKeyResult = null;
+      await bb.storage.kv.set(KEY_STATE_KEY, state);
+      changed();
+      // A newly saved key that Jev accepts turns Nudger on, whatever was switched off before.
+      if (checked.activate) {
+        await settings.experimental_set({ detector: "jev", enabled: true });
+        // Applied in this same queued step, so anyone awaiting it already sees Nudger on.
+        return configure();
+      }
+    }
+    const rejected = state.check?.fingerprint === fingerprint && state.check.result === "rejected";
+    const signature = JSON.stringify([config.enabled, config.detector ?? "none", key, rejected]);
     if (configuredSignature === signature && configurationError === null) return;
     operational = false;
     continuation?.cancelAll("Nudger detector or enablement settings changed");
@@ -118,16 +156,11 @@ export default function plugin(bb: BbPluginApi) {
     try {
       const migration = await bb.storage.kv.get<{ complete: boolean }>(MIGRATION_KEY);
       if (!migration?.complete && await bb.storage.kv.get(LEGACY_ACTIVATION_KEY)) throw new Error("Legacy migration is incomplete; observation continues, but imported detector settings wait for pause and per-thread policy restoration.");
-      const imported = await bb.storage.kv.get<ImportedSettings>(LEGACY_SETTINGS_KEY);
       if (revision !== settingsRevision) return;
-      if (config.detector === undefined && imported?.detector === "jev") {
-        throw new Error("Headquarters history and preferences are retained. To use Jev, enter your TypeSafe key in Nudger's secret setting and explicitly select Jev. The encrypted Headquarters credential remains unchanged; no paid detector is enabled by migration.");
-      }
-      // A stored "luna" value no longer matches the select options, so BB reads it as unset: the effective detector is none.
-      if (config.detector === undefined && (imported?.detector === "luna" || lastClassifiedByLuna())) throw new Error(LUNA_REMOVED);
       if (config.enabled && config.detector === "jev") {
-        if (!config.typesafeApiKey) throw new Error("Enter the TypeSafe API key in Nudger settings before selecting Jev.");
-        recovery?.configure(jev(config.typesafeApiKey)); operational = true;
+        if (!key) throw new Error("Paste your Jev API key in Nudger settings.");
+        if (rejected) throw new Error("Jev rejected this API key. Paste a valid key from console.typesafe.ai.");
+        recovery?.configure(jev(key)); operational = true;
       }
     } catch (cause) { configurationError = cause instanceof Error ? cause.message : String(cause); }
     if (revision !== settingsRevision) return;
@@ -174,7 +207,12 @@ export default function plugin(bb: BbPluginApi) {
   async function configuration(): Promise<NudgerConfiguration> {
     await ensureReady(); await changes;
     const config = await settings.get();
-    return { version: 1 as const, enabled: config.enabled, detector: config.detector === "jev" ? "jev" : "none", keyConfigured: !!config.typesafeApiKey, paused: recovery!.status().paused, error: configurationError };
+    const state = await bb.storage.kv.get<KeyState>(KEY_STATE_KEY) ?? EMPTY_KEY_STATE;
+    const fingerprint = config.typesafeApiKey ? keyFingerprint(config.typesafeApiKey) : null;
+    const check = fingerprint && state.check?.fingerprint === fingerprint ? state.check : null;
+    return { version: 1 as const, enabled: config.enabled, detector: config.detector === "jev" ? "jev" : "none",
+      key: fingerprint ? check?.result ?? "saved" : "missing", keyDetail: check?.detail ?? null,
+      active: operational, paused: recovery!.status().paused, error: configurationError };
   }
   // Retained records keep only the final message's identity; its text is read once, from that exact event, and cached.
   const recordedMessages = new Map<string, string | null>();
@@ -411,7 +449,7 @@ export default function plugin(bb: BbPluginApi) {
       await ensureReady();
       return serial(async () => {
         const config = await settings.get();
-        if (!config.typesafeApiKey) return { exitCode: 1, stderr: "Configure the TypeSafe secret in Nudger settings. No fallback model is used." };
+        if (!config.typesafeApiKey) return { exitCode: 1, stderr: "Paste your Jev API key in Nudger settings. No fallback model is used." };
         const comparison = await runShadowComparison({ detectors: [jev(config.typesafeApiKey)], signal: context.signal ? AbortSignal.any([signal, context.signal]) : signal });
         await bb.storage.kv.set("detector/synthetic-shadow", comparison); await usage.flush(); changed();
         return { exitCode: comparison.summaries.some(summary => summary.failures) ? 1 : 0, stdout: JSON.stringify(comparison, null, 2) };
@@ -419,14 +457,24 @@ export default function plugin(bb: BbPluginApi) {
     }
     return { exitCode: !args.length || args.length === 1 && ["--help", "-h"].includes(args[0]!) ? 0 : 1, stdout: "Usage: bb nudger <status|continuation [<threadId> [on|off]]|decisions [--since <date>] [--out <path>]|label <recordId> <wrong|clear>|verify|shadow --confirm-paid-synthetic>" };
   } });
-  settings.onChange(() => {
+  settings.onChange((next, prev) => {
     settingsRevision++;
     // Native BB writes are already effective when this fires, outside the plugin queue.
     // Revoke the old detector immediately, and fence configure() awaits by revision.
     configuredSignature = null; operational = false;
     continuation?.cancelAll("Nudger detector or enablement settings changed");
     recovery?.configure(null);
-    if (!signal.aborted && recovery) void serial(configure).catch(cause => { if (!signal.aborted) bb.log.warn(`Nudger settings refresh failed: ${String(cause)}`); });
+    if (signal.aborted) return;
+    const saved = next.typesafeApiKey && next.typesafeApiKey !== prev.typesafeApiKey ? next.typesafeApiKey : null;
+    void serial(async () => {
+      // A saved key is checked next. A new one then turns Nudger on; the key that already did never overrides a later "off".
+      if (saved) {
+        const state = await bb.storage.kv.get<KeyState>(KEY_STATE_KEY) ?? EMPTY_KEY_STATE;
+        const fingerprint = keyFingerprint(saved);
+        await bb.storage.kv.set(KEY_STATE_KEY, { ...state, pending: { fingerprint, activate: fingerprint !== state.activated } });
+      }
+      if (recovery) await configure();
+    }).catch(cause => { if (!signal.aborted) bb.log.warn(`Nudger settings refresh failed: ${String(cause)}`); });
   });
   async function close() {
     lifetime.abort(); clearTimeout(publishTimer);

@@ -10,7 +10,9 @@ const continuationStatusSchema: z.ZodType<ContinuationStatus> = z.object({
   sendAt: z.number().nullable(), totalMs: z.number().nullable(), checkIn: z.boolean(), text: z.string().max(8192).nullable(), detail: z.string().max(8192).nullable(), updatedAt: z.number(), nudgeCount: z.number().int().nonnegative(),
 }).strict();
 export const detectors = ["none", "jev"] as const;
-export const configurationSchema = z.object({ version: z.literal(1), enabled: z.boolean(), detector: z.enum(detectors), keyConfigured: z.boolean(), paused: z.boolean(), error: z.string().nullable() });
+/** `key`: none saved, saved but not checked yet, accepted, refused by Jev, or not checkable right now (`keyDetail` says why). */
+export const configurationSchema = z.object({ version: z.literal(1), enabled: z.boolean(), detector: z.enum(detectors), key: z.enum(["missing", "saved", "connected", "rejected", "unreachable"]),
+  keyDetail: z.string().nullable(), active: z.boolean(), paused: z.boolean(), error: z.string().nullable() });
 export type NudgerConfiguration = z.infer<typeof configurationSchema>;
 export const rpcContract = defineRpcContract({
   nudger_snapshot_v1: { input: versionSchema, output: snapshotSchema },

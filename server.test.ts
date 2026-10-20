@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,8 @@ import plugin from "./server.js";
 import { decisionSchema, decisionsSchema, labelSchema, snapshotSchema, type MigrationPage, type NudgerSnapshot } from "./nudger-contract.js";
 import type { ThreadEventRow } from "./recovery-contract.js";
 import { LEGACY_ACTIVATION_KEY, LEGACY_DATA_PREFIX, LEGACY_SETTINGS_KEY } from "./migration-storage.js";
-import { configurationSchema } from "./rpc-contract.js";
+import { configurationSchema, type NudgerConfiguration } from "./rpc-contract.js";
+import { KEY_STATE_KEY } from "./jev-key.js";
 import { statsSchema } from "./stats.js";
 import type { ContinuationSnapshot } from "./continuation.js";
 
@@ -61,6 +62,7 @@ function fixture(options: { settings?: Record<string, string | boolean>; headqua
   options.beforePlugin?.(bb);
   plugin(bb);
   const snapshot = async (): Promise<NudgerSnapshot> => snapshotSchema.parse(await harness.callRpc("nudger_snapshot_v1", { version: 1 }));
+  const config = async (): Promise<NudgerConfiguration> => configurationSchema.parse(await harness.callRpc("nudger_settings_v1", { version: 1 }));
   const dispatch = async (context: ReturnType<typeof makeMessageDispatchHookContext>) => harness.registrations.hooks["message.dispatch"]!(context);
   async function finish(text = "Still implementing the assigned work.") {
     const seq = Math.max(0, ...(history.get("worker") ?? []).map(row => row.seq));
@@ -75,7 +77,7 @@ function fixture(options: { settings?: Record<string, string | boolean>; headqua
     for (let attempt = 0; attempt < 100; attempt++) { const value = await snapshot(); if (predicate(value)) return value; await nextTurn(); }
     throw new Error("Expected live producer state did not arrive");
   }
-  return { bb, harness, threads, history, controls, snapshot, dispatch, finish, until };
+  return { bb, harness, threads, history, controls, snapshot, config, dispatch, finish, until };
 }
 /** `ending: null` answers in the shape judgments had before the `ending`/`waits_on`/`consequence` questions existed. */
 function jevResponse(classification: "continue" | "blocker" | "finished", ending: "request" | "operator_chosen" | "report" | null = "report") {
@@ -89,6 +91,19 @@ function jevResponse(classification: "continue" | "blocker" | "finished", ending
       consequence: { type: "choice", choice: "none", confidence: 1, probabilities: { money: 0, data: 0, production: 0, "priority-product": 0, irreversible: 0, none: 1 } },
     },
   }, usage: { input_tokens: 42, output_tokens: 3 } }), { status: 200, headers: { "content-type": "application/json" } });
+}
+const MODELS_URL = "https://api.typesafe.ai/v1/models";
+/** TypeSafe's API: the key check (GET /v1/models) answers `keyStatus(key)`; a judgment (POST /v1/systemone) answers `judge()`. */
+function typesafe(t: TestContext, keyStatus: (key: string) => number, judge = async () => jevResponse("continue")) {
+  const fetch = t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) !== MODELS_URL) return judge();
+    const status = keyStatus(new Headers(init?.headers).get("authorization")?.replace(/^Bearer /, "") ?? "");
+    return new Response(JSON.stringify(status === 200 ? { models: [{ name: "jev-latest", description: "General-purpose system one model.", release_date: "2026-09-15" }] } : { detail: { error_type: "authentication_error" } }), { status });
+  });
+  return {
+    checks: () => fetch.mock.calls.filter(call => String(call.arguments[0]) === MODELS_URL).length,
+    judgments: () => fetch.mock.calls.filter(call => String(call.arguments[0]) !== MODELS_URL).length,
+  };
 }
 
 test("standalone factory watches with zero setup and none never calls a model or dispatches", async t => {
@@ -240,17 +255,18 @@ test("a retained obstacle published before it could be re-judged is still re-jud
   assert.equal(fetch.mock.callCount(), 2); assert.equal(h.controls.sends, 0);
 });
 
-test("factory loading rejects owned submissions, while an unavailable legacy key keeps classification gated", async t => {
+test("factory loading rejects owned submissions, and an imported Jev choice without a key never classifies", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("Missing key must never call a model"); });
   const h = fixture({ headquarters: true, migration: { version: 1, entries: [], settings: { detector: "jev" }, nextCursor: null } }); t.after(() => h.harness.dispose());
   const loading = await h.dispatch(makeMessageDispatchHookContext({ experimental_submission: { pluginId: "nudger", data: { continuationNudge: "stale" } } }));
   assert.equal(loading.action, "reject");
   const value = await h.snapshot(); assert.equal(value.status.classifying, false); assert.equal(value.status.detectorId, null);
-  assert.match(value.status.gates.join(" "), /enter your TypeSafe key.*explicitly select Jev/);
+  const config = await h.config();
+  assert.deepEqual([config.key, config.active, config.detector], ["missing", false, "none"]);
   assert.equal(fetch.mock.callCount(), 0); assert.equal(h.controls.sends, 0);
 });
 
-test("a removed Luna choice reads as none behind a clear gate, never classifies, and Luna-era history stays readable", async t => {
+test("a leftover Luna choice reads as off, never classifies, and Luna-era history stays readable", async t => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("A removed detector must never call a model"); });
   const lunaRecord = { id: "legacy-luna", threadId: "worker", projectId: "project", runId: "old-run", messageId: "old-message", messageRevision: 1, observedAt: Date.now() - 60_000,
     classification: "blocker", action: "reported", reason: "Legacy obstacle", detector: "cassidy-codex-gpt-6-luna-medium-fast",
@@ -263,9 +279,8 @@ test("a removed Luna choice reads as none behind a clear gate, never classifies,
     const h = fixture({ headquarters: true, migration, settings: { detector: "luna" } }); t.after(() => h.harness.dispose());
     const value = await h.snapshot();
     assert.equal(value.status.classifying, false); assert.equal(value.status.detectorId, null);
-    assert.match(value.status.gates.join(" "), /Luna was removed; select Jev/);
     const config = configurationSchema.parse(await h.harness.callRpc("nudger_settings_v1", { version: 1 }));
-    assert.equal(config.detector, "none"); assert.match(config.error ?? "", /Luna was removed; select Jev/);
+    assert.equal(config.detector, "none"); assert.equal(config.active, false); assert.equal(config.error, null);
     if (migration.settings.detector) assert.deepEqual(await h.bb.storage.kv.get(LEGACY_SETTINGS_KEY), { detector: "luna", keyAvailable: false });
     if (migration.entries.length) {
       assert.equal(value.records.find(record => record.id === "legacy-luna")?.detector, lunaRecord.detector);
@@ -425,7 +440,7 @@ test("foreign plugins cannot mutate settings, secrets, enablement, pause, toggle
   assert.deepEqual(h.harness.sdk.calls, []);
   assert.deepEqual(await h.bb.storage.kv.list(), []);
   const settings = configurationSchema.parse(await h.harness.callRpc("nudger_settings_v1", { version: 1 }, foreign));
-  assert.equal(settings.detector, "none"); assert.equal(settings.keyConfigured, true);
+  assert.equal(settings.detector, "none"); assert.equal(settings.key, "saved"); assert.equal(settings.active, false);
   assert.equal((await h.snapshot()).status.classifying, false);
   await h.harness.callRpc("nudger_history_v1", { version: 1 }, foreign);
   await h.harness.callRpc("nudger_continuation_status_v1", { threadId: "worker" }, foreign);
@@ -455,7 +470,8 @@ test("foreign toggle and cancel cannot alter an operator-owned pending decision"
 
 test("late import shares the mutation lane while standard BB settings remain independently authoritative", async t => {
   t.mock.timers.enable({ apis: ["setInterval"] });
-  const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("Concurrent explicit none must remain passive"); });
+  // Jev refuses the new keys below, so nothing turns Nudger back on behind the explicit "off".
+  const api = typesafe(t, () => 401, async () => { throw new Error("Concurrent explicit none must remain passive"); });
   for (const gate of ["marker", "preferences"] as const) {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     const migration: MigrationPage = { version: 1, entries: [
@@ -491,7 +507,8 @@ test("late import shares the mutation lane while standard BB settings remain ind
     release.resolve();
     await Promise.all([settingsWrite, pause, bridgePause, toggle, cli, cancel]);
     const config = configurationSchema.parse(await h.harness.callRpc("nudger_settings_v1", { version: 1 }));
-    assert.equal(config.detector, "none"); assert.equal(config.enabled, false); assert.equal(config.paused, true);
+    // The new keys are checked; Jev refuses them, and the explicit "off" stands.
+    assert.equal(config.detector, "none"); assert.equal(config.enabled, false); assert.equal(config.paused, true); assert.equal(config.key, "rejected");
     assert.equal(await h.bb.storage.kv.get("recovery.paused"), true);
     assert.equal(await h.bb.storage.kv.get("continuation.off.worker"), true);
     assert.equal(await h.bb.storage.kv.get("continuation.off.headquarters"), true);
@@ -507,18 +524,19 @@ test("late import shares the mutation lane while standard BB settings remain ind
     for (const key of await h.bb.storage.kv.list()) assert.doesNotMatch(JSON.stringify(await h.bb.storage.kv.get(key)), /legacy-secret|native-new-secret|rpc-new-secret/);
     service.controller.abort(); await service.done;
   }
-  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(api.judgments(), 0);
 });
 
 test("a direct BB write fences an old configure read across awaits and immediately revokes paid configuration", async t => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("Stale settings cannot activate a model"); });
+  // Jev refuses the newly written key, so only the fence decides what runs.
+  const api = typesafe(t, () => 401, async () => { throw new Error("Stale settings cannot activate a model"); });
   const h = fixture({ settings: { detector: "jev", typesafeApiKey: "old-key" }, beforePlugin(bb) {
     const get = bb.storage.kv.get.bind(bb.storage.kv);
     let first = true;
     bb.storage.kv.get = async <T>(key: string): Promise<T | undefined> => {
       const captured = await get<T>(key);
-      if (first && key === LEGACY_SETTINGS_KEY) { first = false; entered.resolve(); await release.promise; }
+      if (first && key === KEY_STATE_KEY) { first = false; entered.resolve(); await release.promise; }
       return captured;
     };
   } });
@@ -531,7 +549,7 @@ test("a direct BB write fences an old configure read across awaits and immediate
   assert.equal(config.detector, "none"); assert.equal(config.enabled, false);
   await h.finish();
   assert.equal((await h.snapshot()).status.classifying, false);
-  assert.equal(fetch.mock.callCount(), 0); assert.equal(h.controls.sends, 0);
+  assert.equal(api.judgments(), 0); assert.equal(h.controls.sends, 0);
 });
 
 test("a fresh operator message durably overrides an imported Stop without modifying the legacy baseline", async t => {
@@ -575,4 +593,103 @@ test("the decision log pages over RPC and exports JSONL with labels", async t =>
   assert.equal((await h.harness.runCli(["label", decision!.id, "clear"])).exitCode, 0);
   assert.equal(decisionsSchema.parse(await h.harness.callRpc("nudger_decisions_v1", { version: 1 })).decisions[0]!.label, null);
   assert.equal(h.controls.sends, 0);
+});
+
+test("a fresh install does nothing until a Jev key is saved, and a key Jev accepts turns Nudger on by itself", async t => {
+  const api = typesafe(t, key => key === "fresh-key" ? 200 : 401);
+  const h = fixture(); t.after(() => h.harness.dispose());
+  const fresh = await h.config();
+  assert.deepEqual([fresh.key, fresh.active, fresh.error], ["missing", false, null]);
+  assert.equal(api.checks() + api.judgments(), 0);
+  await h.harness.setSettings({ typesafeApiKey: "fresh-key" });
+  const on = await h.config();
+  assert.deepEqual([on.key, on.active, on.enabled, on.detector], ["connected", true, true, "jev"]);
+  await h.snapshot(); await h.finish();
+  await h.until(value => value.records[0]?.action === "nudged");
+  assert.deepEqual([api.checks(), api.judgments()], [1, 1]);
+});
+
+test("turning Nudger off survives saving the same key again; a new key or turning it on re-enables it", async t => {
+  const api = typesafe(t, () => 200);
+  const h = fixture(); t.after(() => h.harness.dispose());
+  // Saved before the watcher loaded: the key still turns Nudger on once it does.
+  await h.harness.setSettings({ typesafeApiKey: "first-key" });
+  assert.equal((await h.config()).active, true);
+  await h.harness.setSettings({ enabled: false });
+  // The same key again: as an unchanged value, then cleared and pasted back.
+  await h.harness.setSettings({ typesafeApiKey: "first-key" });
+  await h.harness.setSettings({ typesafeApiKey: null });
+  await h.harness.setSettings({ typesafeApiKey: "first-key" });
+  const stillOff = await h.config();
+  assert.deepEqual([stillOff.enabled, stillOff.active, stillOff.key], [false, false, "connected"]);
+  await h.snapshot(); await h.finish();
+  await h.until(value => value.records[0]?.action === "suppressed");
+  assert.equal(api.judgments(), 0);
+  const turnedOn = configurationSchema.parse(await h.harness.callRpc("nudger_settings_set_v1", { version: 1, enabled: true, detector: "jev" }));
+  assert.deepEqual([turnedOn.enabled, turnedOn.active], [true, true]);
+  await h.harness.setSettings({ detector: "none" });
+  assert.equal((await h.config()).active, false);
+  await h.harness.setSettings({ typesafeApiKey: "second-key" });
+  const renewed = await h.config();
+  assert.deepEqual([renewed.enabled, renewed.detector, renewed.active, renewed.key], [true, "jev", true, "connected"]);
+  assert.equal(api.checks(), 3);
+  for (const key of await h.bb.storage.kv.list()) assert.doesNotMatch(JSON.stringify(await h.bb.storage.kv.get(key)), /first-key|second-key/);
+});
+
+test("a key Jev rejects never turns Nudger on, and a key refused mid-run stops Jev at once with the reason shown", async t => {
+  const accepted = new Set(["good-key"]);
+  const api = typesafe(t, key => accepted.has(key) ? 200 : 401,
+    async () => new Response(JSON.stringify({ detail: { error_type: "authentication_error" } }), { status: 401 }));
+  const h = fixture(); t.after(() => h.harness.dispose());
+  await h.harness.setSettings({ typesafeApiKey: "typo-key" });
+  const rejected = await h.config();
+  assert.deepEqual([rejected.key, rejected.active, rejected.detector], ["rejected", false, "none"]);
+  await h.harness.setSettings({ typesafeApiKey: "good-key" });
+  assert.equal((await h.config()).active, true);
+  accepted.clear();
+  await h.snapshot(); await h.finish();
+  const failed = await h.until(value => value.records[0]?.action === "error");
+  assert.match(failed.records[0]!.reason, /Jev rejected the API key/);
+  const revoked = await h.config();
+  assert.deepEqual([revoked.key, revoked.active], ["rejected", false]);
+  assert.match(revoked.error ?? "", /Jev rejected this API key/);
+  assert.equal((await h.snapshot()).status.classifying, false);
+  // The thread's own reason is on its decision; with Jev stopped, its banner says Nudger is off.
+  const banner = await h.harness.callRpc("nudger_continuation_status_v1", { threadId: "worker" });
+  assert.equal(banner && typeof banner === "object" ? Reflect.get(banner, "text") : null, "Nudger is off");
+  assert.equal(decisionsSchema.parse(await h.harness.callRpc("nudger_decisions_v1", { version: 1 })).decisions.at(-1)!.gate, "key-rejected");
+  assert.deepEqual([api.judgments(), h.controls.sends], [1, 0]);
+});
+
+test("when Jev cannot be reached on save, the key waits and Check again turns Nudger on", async t => {
+  let reachable = false;
+  typesafe(t, () => reachable ? 200 : 503);
+  const h = fixture(); t.after(() => h.harness.dispose());
+  await h.harness.setSettings({ typesafeApiKey: "new-key" });
+  const waiting = await h.config();
+  assert.deepEqual([waiting.key, waiting.keyDetail, waiting.active], ["unreachable", "Jev answered HTTP 503", false]);
+  reachable = true;
+  const checked = configurationSchema.parse(await h.harness.callRpc("nudger_settings_set_v1", { version: 1 }));
+  assert.deepEqual([checked.key, checked.active, checked.detector], ["connected", true, "jev"]);
+});
+
+test("an upgrade keeps explicit settings: a key saved before 0.1.1 is never treated as newly saved", async t => {
+  const api = typesafe(t, () => 200, async () => jevResponse("finished"));
+  const installs: Array<[Record<string, string | boolean>, boolean]> = [
+    [{ detector: "jev", typesafeApiKey: "existing-key" }, true],
+    [{ detector: "none", typesafeApiKey: "existing-key" }, false],
+    [{ enabled: false, detector: "jev", typesafeApiKey: "existing-key" }, false],
+    [{ typesafeApiKey: "existing-key" }, false],
+  ];
+  for (const [settings, active] of installs) {
+    const h = fixture({ settings }); t.after(() => h.harness.dispose());
+    const config = await h.config();
+    assert.deepEqual([config.enabled, config.detector, config.active, config.key], [settings.enabled ?? true, settings.detector ?? "none", active, "saved"], JSON.stringify(settings));
+    assert.equal(await h.bb.storage.kv.get(KEY_STATE_KEY), undefined);
+    await h.snapshot(); await h.finish("All done; nothing left to do.");
+    await h.until(value => value.records[0]?.action === (active ? "finished" : "suppressed"));
+    // A live answer from Jev is proof the key works.
+    assert.equal((await h.config()).key, active ? "connected" : "saved");
+  }
+  assert.deepEqual([api.checks(), api.judgments()], [0, 1]);
 });

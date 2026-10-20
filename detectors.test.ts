@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createJevDetector, jevBlockerFacts, jevCheckIn, routeJevAnswers, runShadowComparison } from "./detectors.js";
-import { JEV_NO_CREDITS } from "./continuation-copy.js";
+import { JEV_KEY_REJECTED, JEV_NO_CREDITS } from "./continuation-copy.js";
 import type { FinalMessageClassifier, FinalMessageJudgment } from "./recovery-contract.js";
 import { RECOVERY_SHADOW_CORPUS } from "./recovery-shadow-corpus.js";
 
@@ -112,9 +112,11 @@ test("malformed Jev output does not become a default continuation", async () => 
   await assert.rejects(detector.classify("I will continue the remaining work."));
 });
 
-test("TypeSafe refusing for billing reads as out of credits, other HTTP failures stay generic", async () => {
+test("TypeSafe refusing for billing reads as out of credits, a refused key as rejected, other HTTP failures stay generic", async () => {
   const billing = createJevDetector({ apiKey: "test-key", fetch: async () => new Response(JSON.stringify({ detail: { error_type: "billing_error" } }), { status: 402 }) });
   await assert.rejects(billing.classify("Done."), { message: JEV_NO_CREDITS });
+  const refused = createJevDetector({ apiKey: "revoked-key", fetch: async () => new Response(JSON.stringify({ detail: { error_type: "authentication_error" } }), { status: 401 }) });
+  await assert.rejects(refused.classify("Done."), { message: JEV_KEY_REJECTED });
   const outage = createJevDetector({ apiKey: "test-key", fetch: async () => new Response("", { status: 503 }) });
   await assert.rejects(outage.classify("Done."), { message: "Jev evaluation failed with HTTP 503" });
 });

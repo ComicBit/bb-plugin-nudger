@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk";
 import { CHECK_IN_MS, NUDGE_STREAK_LIMIT, SCHEDULED_REASON, type Continuation } from "./continuation.js";
-import { CANCEL_REASON, HELD_REASON, isNoCreditsError, NUDGE_STREAK_REASON, WITHHELD_REASON } from "./continuation-copy.js";
+import { CANCEL_REASON, HELD_REASON, isKeyRejectedError, isNoCreditsError, NUDGE_STREAK_REASON, WITHHELD_REASON } from "./continuation-copy.js";
 import { RECOVERY_NUDGE, type FinalMessageClassifier, type RecoveryBlocker, type RecoveryCursor, type RecoveryInventoryProject, type RecoveryInventoryThread, type RecoveryNudgeDecision, type RecoveryRecord, type RecoveryService, type RecoveryStatus, type RecoveryThreadState, type RecoveryWait, type RecoveryWaitKind, type ThreadEventRow } from "./recovery-contract.js";
 import { createKvWriter } from "./kv-writer.js";
 import { SETTLE_MS, threadRunning, workflowOwner } from "./running-work.js";
@@ -613,7 +613,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
         await serial(async () => {
           if (disposed || job.controller.signal.aborted) return;
           const reason = `Final-message classification/reporting failed: ${caught instanceof Error ? caught.message : String(caught)}`;
-          decide(record, "error", isNoCreditsError(reason) ? GATE.noCredits : GATE.detectorError, reason);
+          decide(record, "error", isNoCreditsError(reason) ? GATE.noCredits : isKeyRejectedError(reason) ? GATE.keyRejected : GATE.detectorError, reason);
           await persist(record);
           changed();
         });

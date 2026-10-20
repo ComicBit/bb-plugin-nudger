@@ -1,15 +1,15 @@
 {
   "name": "bb-plugin-nudger",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
-  "description": "Keep unfinished agent work moving with guarded continuation, composer controls, and local statistics.",
+  "description": "Agents stop halfway and wait for you to type “go on”. Nudger types it for you: Jev reads each stopped thread and nudges only unfinished work, never past a blocker or a request for permission.",
   "type": "module",
   "repository": { "type": "git", "url": "https://github.com/ComicBit/bb-plugin-nudger.git" },
   "exports": { "./contract": "./nudger-contract.ts" },
   "engines": { "bb": ">=0.46", "bbPluginSdk": ">=0.6.39" },
   "bb": {
     "name": "Nudger",
-    "description": "Keep unfinished agent work moving with guarded continuation, composer controls, and local statistics. Optional paid TypeSafe Jev API.",
+    "description": "Agents stop halfway and wait for you to type “go on”. Nudger types it for you: Jev reads each stopped thread and nudges only unfinished work, never past a blocker or a request for permission.",
     "branding": { "icon": "./hand.svg", "experimental_icons": { "hand": "./hand.svg" } },
     "server": "./server.ts",
     "app": "./app.tsx",

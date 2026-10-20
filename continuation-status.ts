@@ -1,5 +1,5 @@
 import type { Nudge } from "./continuation.js";
-import { cancelledCopy, isNoCreditsError, LINE, type Line, suppressedCopy, waitLine, withheldCopy } from "./continuation-copy.js";
+import { cancelledCopy, isKeyRejectedError, isNoCreditsError, LINE, type Line, suppressedCopy, waitLine, withheldCopy } from "./continuation-copy.js";
 import { GATE } from "./decision-log.js";
 import type { RecoveryInventoryThread, RecoveryRecord, RecoveryThreadState } from "./recovery-contract.js";
 
@@ -86,7 +86,7 @@ function outcome(recovery: RecoveryThreadState, thread: RecoveryInventoryThread,
   if (recovery.wait) return ["waiting", waitLine(recovery.wait.kind, recovery.wait.running)];
   if (!record) return ["watching", LINE.watchingNext];
   if (record.action === "observed" && record.classification === null) return ["assessing", LINE.reading];
-  if (record.action === "error") return ["skipped", isNoCreditsError(record.reason) ? LINE.noCredits : LINE.readError];
+  if (record.action === "error") return ["skipped", isNoCreditsError(record.reason) ? LINE.noCredits : isKeyRejectedError(record.reason) ? LINE.keyRejected : LINE.readError];
   if (record.classification === "continue") {
     const forRecord = nudge && nudge.runId === record.runId && nudge.messageId === record.messageId && nudge.messageRevision === record.messageRevision ? nudge : null;
     if (forRecord?.state === "sent") return ["sent", LINE.nudged];

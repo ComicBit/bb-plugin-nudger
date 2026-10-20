@@ -1,34 +1,36 @@
-Watch native BB threads, see what needs attention, and optionally let an assistant continue unfinished work with guarded `please continue` messages. Nudger is standalone: Headquarters, Hermes, and a machine connection are not required.
+Your agents stop halfway. “Want me to continue?” “Next I'll wire up the tests.” Then the thread sits idle until you come back and type “go on”. Nudger types it for you, but only when the work is really unfinished.
 
-Requires BB >=0.46 and Plugin SDK >=0.6.39. Package: `bb-plugin-nudger`; installed ID: `nudger`; CLI: `bb nudger`. Source installation and developer details are in README.md.
+## What it does
 
-## Safe default: observe only
+Nudger watches every thread. When an agent stops, [Jev](https://typesafe.ai) reads the last reply and judges what kind of stop it is:
 
-The detector defaults to **None — observe only**. Inventory, composer banners, and local statistics need no API key, make no model calls, and send no automatic messages. Adding a key or importing legacy settings does not enable Jev; select it explicitly.
+- **Unfinished work** the agent can do itself: Nudger sends `please continue` after a 20-second countdown you can cancel.
+- **A real blocker**, like a missing credential or a broken service: no nudge, it goes on your list.
+- **A request for you**: permission, a decision, a review. Never continued, always shown to you.
+- **Done**: left alone.
 
-## Enable Jev (optional paid service)
+Only the first gets a nudge. Each thread's banner shows what Nudger decided, and the Nudger page lists every thread that needs you, so you see at a glance where to look. When Jev isn't sure, Nudger doesn't guess: the thread lands on that list. If the agent handed the work to a subthread, a workflow or a running build, Nudger waits for it, and checks in after 30 minutes only if nothing reports back.
 
-1. Create or sign in to **your own TypeSafe account** at [console.typesafe.ai](https://console.typesafe.ai), obtain your own API key, and arrange credits/billing there. No account, key, or credits are bundled.
-2. Open **Settings → Installed plugins → Nudger** in BB.
-3. Enter the key in the **TypeSafe API key** secret setting. Never put it in a chat or source file.
-4. Explicitly choose **Detector → Jev — TypeSafe API**. **Enable automatic continuation** must be on for classification and dispatch.
+## How it uses Jev
 
-A missing/invalid key, exhausted credits, service error, or malformed judgment does **not** trigger a blind continuation. The affected ending stays gated or becomes an error. There is no fallback detector. Only newly observed eligible live endings are checked; startup/resume do not replay a backlog.
+Jev is TypeSafe's System One model. It writes no text: it answers typed questions with a probability for every option and a confidence score. Nudger sends the last reply with five fixed questions: is anything blocking, is the work finished, does the reply ask you for something, who acts next, and what's at stake.
 
-## Controls and safety
+Nudger acts only when Jev is confident. A nudge needs at least 90% confidence that the work is unfinished and nothing blocks it, and a reply that asks you for anything is never continued. A failed call, a rejected key or an unreadable answer never becomes a blind nudge. Every decision is kept for up to 30 days with Jev's answers and the reason, so you can see why Nudger nudged or held back (`bb nudger decisions` exports them).
 
-The composer eye toggles continuation for one thread; countdown Cancel cancels one decision. Global disable keeps passive observation running. Pause classification persists and cancels pending nudges. Native Stop stays suppressive until admitted human work re-arms the thread.
+## Set up
 
-Jev checks the final assistant message as untrusted data. Requests to the operator are never automatically continued. Eligible unfinished assistant work gets a 20-second countdown. Work already running in a delegated task gets a check-in after 30 minutes, doubling for unanswered nudges. New activity cancels the timer; three unanswered nudges suppress further continuation until something else arrives.
+1. Get an API key at [console.typesafe.ai](https://console.typesafe.ai/keys).
+2. Paste it in **Settings → Installed plugins → Nudger → Jev API key**.
+3. Done. Nudger checks the key with Jev and turns itself on.
 
-Running subthreads, workflows, and compaction hold continuation. Dispatch rechecks current thread state; queued owned messages are withheld/deleted rather than sent unchecked. A model verdict cannot authorize a new assignment, permission, spend, or publication. BB's dispatch hook is not an atomic core fence for Stop/queue races; Nudger does not claim to remove that upstream limitation.
+## Your controls
+
+- The eye in a thread's composer turns nudges off for that thread; **Cancel** stops one countdown.
+- Pressing Stop holds a thread's nudges until your next message.
+- **Pause** stops all checks for a while. **Automatic continuation** turns Nudger off; it stays off until you turn it back on or save a new key.
 
 ## Privacy and cost
 
-Jev sends eligible **final assistant messages** and classification questions over HTTPS to TypeSafe (`api.typesafe.ai`), not the full thread history. Final replies may still quote sensitive data. Enable it only for data you may share externally, and review TypeSafe's own privacy, retention, and billing terms. Calls may incur charges; Nudger's cost estimate is not a bill or live credit balance.
+Jev sees only the last reply of a stopped thread, sent over HTTPS to TypeSafe, never the rest of the conversation. A reply can still quote code or secrets, so use Nudger only for work you may share with TypeSafe. TypeSafe bills Jev per input token ($0.042 per million); the Nudger page shows your estimated spend. Decisions stay in BB's local plugin storage on your machine.
 
-Local decision logs can contain message text, identifiers, judgments, and labels for up to 30 days, subject to storage caps; selected history/counts remain longer. The Stats page shows nudges, estimated Jev usage/cost, and attention items, caching displayed titles/summaries on this device for up to 7 days. JSONL exports may contain sensitive information: redact before sharing.
-
-## Optional Headquarters integration
-
-Public versioned RPC excludes Headquarters control threads and shares snapshots/history without exposing settings or keys. Legacy migration is copy-only: it never activates old timers, enables paid classification, or copies credentials. No private database access is required. Integrators import the single schema/type source from `bb-plugin-nudger/contract` (TypeScript source for `tsx`/BB bundling).
+Requires BB 0.46 or newer. Source and details: [github.com/ComicBit/bb-plugin-nudger](https://github.com/ComicBit/bb-plugin-nudger). More about Jev: [docs.typesafe.ai](https://docs.typesafe.ai/introduction).

@@ -64,6 +64,7 @@ export const GATE = {
   reported: "obstacle-reported",
   detectorError: "detector-error",
   noCredits: "no-credits",
+  keyRejected: "key-rejected",
   /** A prior process's pending or held ending, never replayed. */
   restart: "restart",
   rejudged: "rejudged",

@@ -6,7 +6,7 @@ export const LEGACY_SENT_KEY = `${LEGACY_DATA_PREFIX}continuation.sentCounts`;
 export const LEGACY_USAGE_PREFIX = `${LEGACY_DATA_PREFIX}usage.detector.`;
 export const LEGACY_ACTIVATION_KEY = "migration.headquarters.activation.v1";
 export const LEGACY_SETTINGS_KEY = "migration.headquarters.settings.v1";
-/** Nonsecret setup information only. A legacy "luna" choice is kept for the removed-detector notice and never selects anything. */
+/** Nonsecret setup information only, kept as imported; it never selects anything. */
 export interface ImportedSettings {
   detector?: "none" | "luna" | "jev";
   keyAvailable: boolean;

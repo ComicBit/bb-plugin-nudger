@@ -10,6 +10,9 @@ const line = (text: string, detail: string | null = null): Line => ({ text, deta
 export const JEV_NO_CREDITS = "Jev is out of TypeSafe credits";
 /** That failure, including records stored before it had its own message ("…failed with HTTP 402"). */
 export const isNoCreditsError = (reason: string) => reason.includes(JEV_NO_CREDITS) || reason.includes("Jev evaluation failed with HTTP 402");
+/** Detector error for a Jev call TypeSafe refused for authentication (HTTP 401/403): the saved key is not accepted. */
+export const JEV_KEY_REJECTED = "Jev rejected the API key";
+export const isKeyRejectedError = (reason: string) => reason.includes(JEV_KEY_REJECTED);
 const NOT_SENT = "No nudge sent";
 const ATTENTION = "Added to Needs your attention";
 
@@ -33,10 +36,11 @@ export const LINE = {
   busy: line("The agent was busy", NOT_SENT),
   stopPressed: line("You pressed Stop", NOT_SENT),
   lastSecond: line("Something changed at the last second", NOT_SENT),
-  paused: line("Auto-continue paused", "Paused for every thread from the dashboard"),
-  noDetector: line("Auto-continue isn't set up", "Choose a detector in Nudger settings"),
+  paused: line("Auto-continue paused", "Paused for every thread in Nudger settings"),
+  noDetector: line("Nudger is off", "Turn it on in Nudger settings"),
   readError: line("Couldn't read the reply", NOT_SENT),
   noCredits: line("Jev is out of credits", "Add TypeSafe credits; no nudge sent"),
+  keyRejected: line("Jev rejected the API key", "Paste a valid key in Nudger settings; no nudge sent"),
   notFollowable: line("Can't follow this run", "It won't be nudged"),
   compacting: line("Compacting the conversation", "I'll check the last reply after"),
   compacted: line("The conversation was compacted", NOT_SENT),
