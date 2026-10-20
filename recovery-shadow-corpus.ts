@@ -15,11 +15,11 @@ export const RECOVERY_SHADOW_CORPUS: readonly ShadowCase[] = [
   {
     id: "task-unblocked",
     source: "synthetic",
-    finalAssistantMessage: "Task A complete; tasks B/C unblocked. The first issue is merged and tested. The remaining two can now proceed, with no outstanding permissions or decisions.",
+    finalAssistantMessage: "Task A complete; tasks B/C unblocked. The first task is merged and tested. The remaining two can now proceed, with no outstanding permissions or decisions.",
     expected: "continue",
     stopped: false,
     policyAction: "nudge",
-    rationale: "Operator-supplied positive policy case: finishing one issue and unblocking remaining current work is not completion of all work.",
+    rationale: "Finishing one task and unblocking remaining current work is not completion of all work.",
   },
   {
     id: "implementation-left",

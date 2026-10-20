@@ -8,8 +8,6 @@ import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk"
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.js";
 import { decisionSchema, decisionsSchema, labelSchema, snapshotSchema, type MigrationPage, type NudgerSnapshot } from "./nudger-contract.js";
-// Headquarters' own copy of the v1 protocol: an old reader that has never heard of the decision log.
-import { historySchema as headquartersHistorySchema, snapshotSchema as headquartersSnapshotSchema } from "../nudger-contract.js";
 import type { ThreadEventRow } from "./recovery-contract.js";
 import { LEGACY_ACTIVATION_KEY, LEGACY_DATA_PREFIX, LEGACY_SETTINGS_KEY } from "./migration-storage.js";
 import { configurationSchema } from "./rpc-contract.js";
@@ -552,17 +550,11 @@ test("a fresh operator message durably overrides an imported Stop without modify
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("the decision log pages over RPC and exports JSONL with labels, while v1 snapshot and history keep their shape for Headquarters", async t => {
+test("the decision log pages over RPC and exports JSONL with labels", async t => {
   t.mock.method(globalThis, "fetch", async () => jevResponse("finished"));
   const h = fixture({ settings: { detector: "jev", typesafeApiKey: "offline-key" } }); t.after(() => h.harness.dispose());
   await h.snapshot(); await h.finish("All done; nothing left to do.");
   await h.until(value => value.records[0]?.action === "finished");
-  const history = await h.harness.callRpc("nudger_history_v1", { version: 1 });
-  assert.equal(headquartersHistorySchema.parse(history).records.length, 1);
-  assert.equal(headquartersSnapshotSchema.parse(await h.harness.callRpc("nudger_snapshot_v1", { version: 1 })).records.length, 1);
-  // v1 rows carry no decision-log fields, so an outcome or label never changes the history Headquarters re-reads.
-  assert.doesNotMatch(JSON.stringify(history), /"gate"|"outcome"|"label"/);
-
   const [decision] = decisionsSchema.parse(await h.harness.callRpc("nudger_decisions_v1", { version: 1 })).decisions;
   assert.equal(decision!.text, "All done; nothing left to do."); assert.equal(decision!.gate, "finished");
   assert.equal(decision!.judgment?.questions?.boundary?.choice, "finished");

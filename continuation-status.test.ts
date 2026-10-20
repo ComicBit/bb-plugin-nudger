@@ -106,7 +106,7 @@ test("a thread waiting on its workflow or compacting says so, and its held endin
   assert.deepEqual(copy({ record: compactingHeld }), ["The conversation was compacted", "No nudge sent"]);
   assert.deepEqual(copy({ record: ending(), nudge: nudged({ state: "cancelled", cancelReason: CANCEL_REASON.maintenance }) }), ["The conversation was compacted", "No nudge sent"]);
   assert.equal(nudgeRejectMessage(WITHHELD_REASON.workflow), "Nudger didn't send its nudge: its workflow was running.");
-  // The Task A record stored before this fix keeps its copy.
+  // A record stored before this fix keeps its copy.
   assert.deepEqual(copy({ record: ending({ classification: null, action: "suppressed", reason: "A later root execution superseded the classified ending" }) }), ["A new run started", "No nudge sent"]);
 });
 

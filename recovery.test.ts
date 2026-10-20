@@ -680,30 +680,30 @@ test("a running nested subthread holds the root while its own parent idles; a ro
   assert.equal(h.service.threadState(root.id).wait, null);
 });
 
-test("the /compact turn that followed Task A's ending never replaces it: the real reply is judged once, after the compaction", async t => {
+test("a /compact turn never replaces the preceding ending: the assistant reply is judged once after compaction", async t => {
   const h = fixture(1, undefined, true); t.after(() => { h.continuation!.dispose(); return h.service.dispose(); });
   const thread = h.threads[0]!, runId = `run-${thread.id}`;
   await h.continuation!.start(); await h.service.start();
   // The ending, then auto-compact's /compact as its own root turn, all in one read.
   h.history.get(thread.id)!.push(
-    message(thread.id, runId, 349, "The fixture setup is complete; the workflow is running…"),
-    turn(thread.id, runId, 36820, true),
-    compactRequest(thread.id, 36821, "creq_compact"),
-    turn(thread.id, "t3", 36822),
-    { id: "event-36823", threadId: thread.id, seq: 36823, createdAt: 36823, scope: { kind: "turn", turnId: "t3" }, type: "item/started",
+    message(thread.id, runId, 9, "The fixture setup is complete; the workflow is running…"),
+    turn(thread.id, runId, 100, true),
+    compactRequest(thread.id, 101, "creq_compact"),
+    turn(thread.id, "t3", 102),
+    { id: "event-103", threadId: thread.id, seq: 103, createdAt: 103, scope: { kind: "turn", turnId: "t3" }, type: "item/started",
       data: { providerThreadId: "provider-thread", item: { id: "compaction", type: "contextCompaction" } } },
-    accepted(thread.id, "t3", 36824, "creq_compact"),
-    message(thread.id, "t3", 36827, "Compaction complete. Tokens: 200000 -> 10000 (saved 190000)."),
-    compacted(thread.id, "t3", 36828),
-    turn(thread.id, "t3", 36829, true));
+    accepted(thread.id, "t3", 104, "creq_compact"),
+    message(thread.id, "t3", 107, "Compaction complete. Tokens: 200000 -> 10000 (saved 190000)."),
+    compacted(thread.id, "t3", 108),
+    turn(thread.id, "t3", 109, true));
   thread.status = "idle";
   await h.harness.emitThreadEvent("thread.idle", { thread, lastAssistantText: "Compaction complete. Tokens: 200000 -> 10000 (saved 190000)." });
   const record = await h.waitForRecord(thread.id, "nudged");
-  assert.deepEqual([record.runId, record.messageId, record.classification], [runId, "message-349", "continue"]);
+  assert.deepEqual([record.runId, record.messageId, record.classification], [runId, "message-9", "continue"]);
   assert.deepEqual(h.classified, ["The fixture setup is complete; the workflow is running…"]);
-  assert.deepEqual(h.service.cursor(thread.id), { runId, messageId: "message-349", messageRevision: 349, knownStop: false, waitingOn: null });
+  assert.deepEqual(h.service.cursor(thread.id), { runId, messageId: "message-9", messageRevision: 9, knownStop: false, waitingOn: null });
   assert.equal(h.service.threadState(thread.id).compacting, false);
-  assert.deepEqual(h.continuation!.snapshot(thread.id).pending.map(nudge => nudge.messageId), ["message-349"]);
+  assert.deepEqual(h.continuation!.snapshot(thread.id).pending.map(nudge => nudge.messageId), ["message-9"]);
   assert.equal(h.service.records().length, 1);
 });
 

@@ -82,7 +82,7 @@ test("work running in a delegated thread or task gets a late check-in; a named o
   const boundary = { type: "choice" as const, choice: "continue" as const, confidence: 0.7, probabilities: { continue: 0.7, finished: 0.1, uncertainty: 0.2 } };
   const report = { type: "choice" as const, choice: "report" as const, confidence: 1, probabilities: { request: 0, operator_chosen: 0, report: 1 } };
   const running = { type: "choice" as const, choice: "running" as const, confidence: 0.9, probabilities: { assistant: 0.05, running: 0.9, operator: 0.05, nothing: 0 } };
-  // "The change is with fixture-delegated-thread. I'll write once it's done."
+  // "The change is with the delegated test thread. I'll write once it's done."
   const checkIn = routeJevAnswers({ obstacle: none, boundary, ending: report, waits_on: running });
   assert.deepEqual(checkIn, { classification: "continue", confidence: 0.8 });
   assert.equal(jevCheckIn({ classification: checkIn.classification, questions: { waits_on: running } }), true);
