@@ -1,19 +1,20 @@
 {
   "name": "bb-plugin-nudger",
   "version": "0.1.0",
-  "description": "Independent native thread watching and guarded final-message continuation for BB.",
+  "description": "Keep unfinished agent work moving with guarded continuation, composer controls, and local statistics.",
   "type": "module",
+  "repository": { "type": "git", "url": "https://github.com/ComicBit/bb-plugin-nudger.git" },
   "exports": { "./contract": "./nudger-contract.ts" },
   "engines": { "bb": ">=0.46", "bbPluginSdk": ">=0.6.39" },
   "bb": {
     "name": "Nudger",
-    "description": "Passive inventory by default; optional Jev classification with guarded continuation, per-thread composer controls and a stats page.",
+    "description": "Keep unfinished agent work moving with guarded continuation, composer controls, and local statistics. Optional paid TypeSafe Jev API.",
     "branding": { "icon": "./hand.svg", "experimental_icons": { "hand": "./hand.svg" } },
     "server": "./server.ts",
     "app": "./app.tsx",
     "skills": ["skills/nudger"]
   },
-  "files": ["dist", "*.ts", "*.tsx", "*.css", "!*.test.ts", "skills/", "hand.svg", "tsconfig.json", "README.md", "PLUGIN_OVERVIEW.md", "lucide-LICENSE.txt"],
+  "files": ["dist", "!dist/*.map", "*.ts", "*.tsx", "*.css", "!*.test.ts", "skills/", "hand.svg", "tsconfig.json", "README.md", "PLUGIN_OVERVIEW.md", "lucide-LICENSE.txt"],
   "scripts": {
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",

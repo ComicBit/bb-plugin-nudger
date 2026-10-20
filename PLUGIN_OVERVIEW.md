@@ -1,5 +1,3 @@
-# Nudger
-
 Watch native BB threads, see what needs attention, and optionally let an assistant continue unfinished work with guarded `please continue` messages. Nudger is standalone: Headquarters, Hermes, and a machine connection are not required.
 
 Requires BB >=0.46 and Plugin SDK >=0.6.39. Package: `bb-plugin-nudger`; installed ID: `nudger`; CLI: `bb nudger`. Source installation and developer details are in README.md.

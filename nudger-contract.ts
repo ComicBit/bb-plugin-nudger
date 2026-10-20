@@ -63,6 +63,7 @@ export const migrationSchema = z.object({
   settings: migrationSettingsSchema, nextCursor: id.nullable(),
 });
 export type NudgerSnapshot = z.infer<typeof snapshotSchema>;
+export type NudgerHistory = z.infer<typeof historySchema>;
 export type MigrationPage = z.infer<typeof migrationSchema>;
 export type NudgerRecord = NudgerSnapshot["records"][number];
 export type NudgerStatus = NudgerSnapshot["status"];

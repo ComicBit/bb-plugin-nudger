@@ -129,7 +129,7 @@ npm pack --dry-run --ignore-scripts
 
 Run these in an isolated checkout without live messages/models. Node tests use the SDK fake host and synthetic detector HTTP responses; they do not hit paid APIs. Tests cover migration crash/retry/reload, immutable imported preferences with concurrent operator and direct BB settings writes, foreign-plugin mutation rejection, default passive factory startup/shutdown, the removed-Luna gate, public history pagination/digests, current control exclusions, native Stop, queued-row ownership, user-dispatch cancellation, live blocker revalidation, stats aggregation, and the transplanted workflow/compaction/detector/ledger suite.
 
-The npm package includes its own sources, styles, SDK-pinned development metadata and built `dist` artifacts. `prepack` builds the package so a published npm archive includes BB's metadata-stamped server/app bundles. Source tests and unrelated Headquarters code are excluded from distribution. This repository change prepares the package; it does not publish a release or run a paid comparison.
+The npm package includes its own sources, styles, SDK-pinned development metadata and built `dist` artifacts. `prepack` builds the package so a published npm archive includes BB's metadata-stamped server/app bundles. Source tests, build source maps (which can contain local build paths), and unrelated Headquarters code are excluded from distribution. This repository change prepares the package; it does not publish a release or run a paid comparison.
 
 No project license is declared yet. Choose licensing before public distribution; the included Lucide notice covers that artwork, not permission to redistribute the entire plugin.
 
