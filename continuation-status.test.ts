@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { continuationStatus, type ContinuationStatusInput } from "./continuation-status.js";
-import { CANCEL_REASON, countdownLine, HELD_REASON, JEV_NO_CREDITS, nudgeRejectMessage, WITHHELD_REASON } from "./continuation-copy.js";
+import { CANCEL_REASON, countdownLine, HELD_REASON, JEV_NO_CREDITS, LINE, nudgeRejectMessage, waitLine, WITHHELD_REASON } from "./continuation-copy.js";
 import type { Nudge } from "./continuation.js";
-import type { RecoveryInventoryThread, RecoveryRecord, RecoveryWorkflowWait } from "./recovery-contract.js";
+import type { RecoveryInventoryThread, RecoveryRecord, RecoveryWait } from "./recovery-contract.js";
 
 const threadId = "thr_watched";
 const JEV = "typesafe-jev-1.13.0";
@@ -19,12 +19,12 @@ function ending(overrides: Partial<RecoveryRecord> = {}): RecoveryRecord {
 function nudged(overrides: Partial<Nudge> = {}): Nudge {
   return { nudgeId: "nudge", threadId, runId: "run-1", messageId: "message-1", messageRevision: 7, sendAt: 41_000, createdAt: 21_000, state: "pending", cancelReason: null, ...overrides };
 }
-interface Case { thread?: RecoveryInventoryThread | null; record?: RecoveryRecord | null; nudge?: Nudge | null; enabled?: boolean; currentRunId?: string | null; classifying?: boolean; paused?: boolean; ownThread?: boolean; detectorId?: string | null; nudgeCount?: number; workflow?: RecoveryWorkflowWait | null; compacting?: boolean }
+interface Case { thread?: RecoveryInventoryThread | null; record?: RecoveryRecord | null; nudge?: Nudge | null; enabled?: boolean; currentRunId?: string | null; classifying?: boolean; paused?: boolean; ownThread?: boolean; detectorId?: string | null; nudgeCount?: number; wait?: RecoveryWait | null; compacting?: boolean }
 function input(options: Case = {}): ContinuationStatusInput {
   return { threadId, now: NOW, ownThread: options.ownThread ?? false, enabled: options.enabled ?? true, nudge: options.nudge ?? null, nudgeCount: options.nudgeCount ?? 0,
     recovery: { thread: options.thread === undefined ? inventory() : options.thread, currentRunId: options.currentRunId === undefined ? "run-1" : options.currentRunId,
       latestRecord: options.record ?? null, classifying: options.classifying ?? true, paused: options.paused ?? false,
-      detectorId: options.detectorId === undefined ? JEV : options.detectorId, workflow: options.workflow ?? null, compacting: options.compacting ?? false } };
+      detectorId: options.detectorId === undefined ? JEV : options.detectorId, wait: options.wait ?? null, compacting: options.compacting ?? false } };
 }
 const copy = (options: Case) => { const { text, detail } = continuationStatus(input(options)); return [text, detail]; };
 const running = inventory({ status: "active", watched: true });
@@ -84,16 +84,16 @@ test("the dispatch reject message carries the plain withheld reason", () => {
 });
 
 test("a thread waiting on its workflow or compacting says so, and its held endings never read as a new run or the last second", () => {
-  assert.deepEqual(continuationStatus(input({ workflow: { running: 1, settlingUntil: null } })),
+  assert.deepEqual(continuationStatus(input({ wait: { kind: "workflow", running: 1, settlingUntil: null } })),
     { state: "waiting", sendAt: null, totalMs: null, checkIn: false, text: "Waiting for its workflow", detail: "1 step running", updatedAt: NOW, nudgeCount: 0 });
   const held = ending({ classification: null, action: "suppressed", reason: HELD_REASON.workflow });
-  assert.deepEqual(copy({ workflow: { running: 3, settlingUntil: null }, record: held }), ["Waiting for its workflow", "3 steps running"]);
-  assert.deepEqual(copy({ workflow: { running: 0, settlingUntil: NOW + 60_000 }, record: held }), ["Waiting for its workflow", "Finishing up"]);
+  assert.deepEqual(copy({ wait: { kind: "workflow", running: 3, settlingUntil: null }, record: held }), ["Waiting for its workflow", "3 steps running"]);
+  assert.deepEqual(copy({ wait: { kind: "workflow", running: 0, settlingUntil: NOW + 60_000 }, record: held }), ["Waiting for its workflow", "Finishing up"]);
   // A step started during the countdown: the countdown still shows, and the wait follows once the nudge is withheld.
-  assert.equal(continuationStatus(input({ workflow: { running: 1, settlingUntil: null }, record: ending(), nudge: nudged() })).state, "countdown");
-  assert.deepEqual(copy({ workflow: { running: 1, settlingUntil: null }, record: ending(), nudge: nudged({ state: "withheld", cancelReason: WITHHELD_REASON.workflow }) }), ["Waiting for its workflow", "1 step running"]);
+  assert.equal(continuationStatus(input({ wait: { kind: "workflow", running: 1, settlingUntil: null }, record: ending(), nudge: nudged() })).state, "countdown");
+  assert.deepEqual(copy({ wait: { kind: "workflow", running: 1, settlingUntil: null }, record: ending(), nudge: nudged({ state: "withheld", cancelReason: WITHHELD_REASON.workflow }) }), ["Waiting for its workflow", "1 step running"]);
   // The owner's own run still reads as watching while its steps work.
-  assert.equal(continuationStatus(input({ thread: running, workflow: { running: 2, settlingUntil: null } })).state, "watching");
+  assert.equal(continuationStatus(input({ thread: running, wait: { kind: "workflow", running: 2, settlingUntil: null } })).state, "watching");
 
   const compactingHeld = ending({ classification: null, action: "suppressed", reason: HELD_REASON.maintenance });
   assert.deepEqual(continuationStatus(input({ thread: running, compacting: true, record: compactingHeld })),
@@ -108,6 +108,22 @@ test("a thread waiting on its workflow or compacting says so, and its held endin
   assert.equal(nudgeRejectMessage(WITHHELD_REASON.workflow), "Nudger didn't send its nudge: its workflow was running.");
   // The Task A record stored before this fix keeps its copy.
   assert.deepEqual(copy({ record: ending({ classification: null, action: "suppressed", reason: "A later root execution superseded the classified ending" }) }), ["A new run started", "No nudge sent"]);
+});
+
+test("a parent waiting on its subthreads shows the wait, and an ending held or withheld for them says why no nudge went out", () => {
+  const cells = ({ text, detail }: { text: string; detail: string | null }) => [text, detail];
+  const held = ending({ classification: null, action: "suppressed", reason: HELD_REASON.subthread });
+  const withheld = nudged({ state: "withheld", cancelReason: WITHHELD_REASON.subthread });
+  for (const options of [{ record: held }, { record: ending(), nudge: withheld }]) {
+    const wait: RecoveryWait = { kind: "subthread", running: 2, settlingUntil: null };
+    assert.equal(continuationStatus(input({ ...options, wait })).state, "waiting");
+    assert.deepEqual(copy({ ...options, wait }), cells(waitLine("subthread", 2)));
+    // Once the wait is over, the unjudged ending is not mistaken for one Nudger simply watches past.
+    assert.equal(continuationStatus(input(options)).state, "skipped");
+    assert.deepEqual(copy(options), cells(LINE.subthreadRan));
+  }
+  // The parent's own run still reads as watching while its subthreads work.
+  assert.equal(continuationStatus(input({ thread: running, wait: { kind: "subthread", running: 1, settlingUntil: null } })).state, "watching");
 });
 
 const LEGACY_REASON = "Live public root-turn ending observed; Published @get-bb/plugin-sdk 0.6.15 has no execution-bound continuation admission coordinated with native Stop, queue precedence and accepted-fresh-user provenance, or universal provider completion interception. Automatic recovery cannot be enabled or verified; ordinary threads.send is not a safe substitute.";

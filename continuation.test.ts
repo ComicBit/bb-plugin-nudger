@@ -11,7 +11,7 @@ function ending(id = threadId): RecoveryRecord {
   return { id: `record-${id}`, threadId: id, projectId: "project", runId: "run-1", messageId: "message-1", messageRevision: 7,
     observedAt: 0, classification: "continue", action: "nudged", reason: "", detector: "fixture", judgment: null };
 }
-const freshCursor = (): RecoveryCursor => ({ runId: "run-1", messageId: "message-1", messageRevision: 7, knownStop: false, waitingForWorkflow: false });
+const freshCursor = (): RecoveryCursor => ({ runId: "run-1", messageId: "message-1", messageRevision: 7, knownStop: false, waitingOn: null });
 
 function fixture() {
   let clock = 1_000;
@@ -195,12 +195,13 @@ test("stop evidence cancels only the named thread's pending nudge; latest keeps 
   assert.equal(h.sends.length, 0);
 });
 
-test("a newer root turn, a busy thread or a running workflow withholds the nudge at send time, with plain copy in the reject", async () => {
+test("a newer root turn, a busy thread, a running workflow or a running subthread withholds the nudge at send time, with plain copy in the reject", async () => {
   const cases: Array<[string, (cursors: Map<string, RecoveryCursor>, core: { status: "idle" | "active" }) => void, string]> = [
-    ["newer root", cursors => { cursors.set(threadId, { runId: "run-2", messageId: null, messageRevision: null, knownStop: false, waitingForWorkflow: false }); }, WITHHELD_REASON.newerRun],
+    ["newer root", cursors => { cursors.set(threadId, { runId: "run-2", messageId: null, messageRevision: null, knownStop: false, waitingOn: null }); }, WITHHELD_REASON.newerRun],
     ["busy", (_cursors, core) => { core.status = "active"; }, `${WITHHELD_REASON.notIdle}: active`],
-    // A workflow step started during the countdown: the thread waits on it, not on a nudge.
-    ["workflow", cursors => { cursors.set(threadId, { ...freshCursor(), waitingForWorkflow: true }); }, WITHHELD_REASON.workflow],
+    // A workflow step or a subthread started during the countdown: the thread waits on it, not on a nudge.
+    ["workflow", cursors => { cursors.set(threadId, { ...freshCursor(), waitingOn: "workflow" }); }, WITHHELD_REASON.workflow],
+    ["subthread", cursors => { cursors.set(threadId, { ...freshCursor(), waitingOn: "subthread" }); }, WITHHELD_REASON.subthread],
   ];
   for (const [name, setup, reason] of cases) {
     const h = await started();

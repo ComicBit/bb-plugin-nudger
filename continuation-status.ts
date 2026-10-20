@@ -1,11 +1,11 @@
 import type { Nudge } from "./continuation.js";
-import { cancelledCopy, isNoCreditsError, LINE, type Line, suppressedCopy, withheldCopy, workflowLine } from "./continuation-copy.js";
+import { cancelledCopy, isNoCreditsError, LINE, type Line, suppressedCopy, waitLine, withheldCopy } from "./continuation-copy.js";
 import { GATE } from "./decision-log.js";
 import type { RecoveryInventoryThread, RecoveryRecord, RecoveryThreadState } from "./recovery-contract.js";
 
 /**
  * `off`: the operator turned auto-continue off for the thread; the banner shows only its toggle.
- * `waiting`: like watching, but the reply is checked only after something finishes (its workflow, a compaction).
+ * `waiting`: like watching, but the reply is checked only after something finishes (its workflow, its subthreads, a compaction).
  */
 export type ContinuationState = "hidden" | "off" | "watching" | "waiting" | "assessing" | "countdown" | "sent" | "skipped";
 
@@ -83,7 +83,7 @@ function outcome(recovery: RecoveryThreadState, thread: RecoveryInventoryThread,
     const followsNudge = nudge?.state === "sent" && latest !== null && nudge.runId === latest.runId;
     return ["watching", followsNudge ? LINE.nudgedWatching : LINE.watchingRun];
   }
-  if (recovery.workflow) return ["waiting", workflowLine(recovery.workflow.running)];
+  if (recovery.wait) return ["waiting", waitLine(recovery.wait.kind, recovery.wait.running)];
   if (!record) return ["watching", LINE.watchingNext];
   if (record.action === "observed" && record.classification === null) return ["assessing", LINE.reading];
   if (record.action === "error") return ["skipped", isNoCreditsError(record.reason) ? LINE.noCredits : LINE.readError];

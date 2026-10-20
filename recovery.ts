@@ -2,9 +2,9 @@ import { z } from "zod";
 import type { BbPluginApi, PluginThreadEventPayloads } from "@get-bb/plugin-sdk";
 import { CHECK_IN_MS, NUDGE_STREAK_LIMIT, SCHEDULED_REASON, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, HELD_REASON, isNoCreditsError, NUDGE_STREAK_REASON, WITHHELD_REASON } from "./continuation-copy.js";
-import { RECOVERY_NUDGE, type FinalMessageClassifier, type RecoveryBlocker, type RecoveryCursor, type RecoveryInventoryProject, type RecoveryInventoryThread, type RecoveryNudgeDecision, type RecoveryRecord, type RecoveryService, type RecoveryStatus, type RecoveryThreadState, type RecoveryWorkflowWait, type ThreadEventRow } from "./recovery-contract.js";
+import { RECOVERY_NUDGE, type FinalMessageClassifier, type RecoveryBlocker, type RecoveryCursor, type RecoveryInventoryProject, type RecoveryInventoryThread, type RecoveryNudgeDecision, type RecoveryRecord, type RecoveryService, type RecoveryStatus, type RecoveryThreadState, type RecoveryWait, type RecoveryWaitKind, type ThreadEventRow } from "./recovery-contract.js";
 import { createKvWriter } from "./kv-writer.js";
-import { WORKFLOW_SETTLE_MS, workflowOwner, workflowStepRunning } from "./workflow-steps.js";
+import { SETTLE_MS, threadRunning, workflowOwner } from "./running-work.js";
 import { LEGACY_DATA_PREFIX, retainedKeys, retainedValue } from "./migration-storage.js";
 import { DECISION_LIMITS, decisionCursor, decisionsAfter, decodeText, encodeText, GATE, historyRecord, historyRecordIds, noneOutcome, nudgeGate, operatorCancelled, OUTCOME_WINDOW_MS, planRetention, RECORD_KEY, TEXT_KEY, toDecision } from "./decision-log.js";
 import { jevBlockerFacts, jevCheckIn } from "./detectors.js";
@@ -112,9 +112,13 @@ function hasActiveExecutionSignal(thread: ObservedThread): boolean {
 }
 
 const PENDING_REASON = "Live public root ending observed; final-message-only classification pending";
-const HELD: Record<string, true> = { [HELD_REASON.workflow]: true, [HELD_REASON.maintenance]: true };
-const HELD_GATE: Record<string, string> = { [HELD_REASON.workflow]: GATE.workflow, [HELD_REASON.maintenance]: GATE.maintenance };
+const HELD: Record<string, true> = { [HELD_REASON.workflow]: true, [HELD_REASON.subthread]: true, [HELD_REASON.maintenance]: true };
+const HELD_GATE: Record<string, string> = { [HELD_REASON.workflow]: GATE.workflow, [HELD_REASON.subthread]: GATE.subthread, [HELD_REASON.maintenance]: GATE.maintenance };
+// A nudge withheld at send time for work the thread waits on is that ending's hold.
+const WAITED: Record<string, true> = { [WITHHELD_REASON.workflow]: true, [WITHHELD_REASON.subthread]: true };
 const PRUNE_INTERVAL_MS = 3_600_000;
+// Bounds the walk up a parent chain, so malformed nesting cannot spin.
+const MAX_NESTING = 32;
 
 export function createRecoveryService(options: RecoveryServiceOptions): RecoveryService {
   const { bb } = options;
@@ -139,11 +143,11 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
   const storedBytes = new Map<string, number>();
   // Only a successful judgment from this runtime and the same detector instance can survive a hold.
   let successfulJudgments = new WeakMap<RecoveryRecord, NonNullable<RecoveryRecord["judgment"]>>();
-  // Running hidden workflow steps per owner thread, each running step's owner, and when an owner
-  // with no step left running stops waiting.
-  const runningSteps = new Map<string, Set<string>>();
-  const stepOwners = new Map<string, string>();
-  const settling = new Map<string, number>();
+  // Work each root waits on (its running workflow steps and subthreads, by kind), each running
+  // thread's root, and when a root with nothing left running stops waiting, and on what it waited.
+  const runningWork = new Map<string, Map<string, RecoveryWaitKind>>();
+  const workRoots = new Map<string, string>();
+  const settling = new Map<string, { until: number; kind: RecoveryWaitKind }>();
   const settleTimers = new Map<string, NodeJS.Timeout>();
   let projects: RecoveryInventoryProject[] = [];
   let detector = options.detector;
@@ -302,24 +306,29 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     void serial(() => persist(job.record)).catch(caught => bb.log.warn(`Recovery cancellation persistence failed: ${String(caught)}`));
     changed();
   }
-  function workflowWait(threadId: string): RecoveryWorkflowWait | null {
-    const running = runningSteps.get(threadId)?.size ?? 0;
-    if (running > 0) return { running, settlingUntil: null };
-    const until = settling.get(threadId);
-    return until !== undefined && until > Date.now() ? { running: 0, settlingUntil: until } : null;
+  function workWait(threadId: string): RecoveryWait | null {
+    const work = runningWork.get(threadId);
+    if (work) {
+      let steps = 0;
+      for (const kind of work.values()) if (kind === "workflow") steps++;
+      return { kind: steps ? "workflow" : "subthread", running: steps || work.size, settlingUntil: null };
+    }
+    const settle = settling.get(threadId);
+    return settle !== undefined && settle.until > Date.now() ? { kind: settle.kind, running: 0, settlingUntil: settle.until } : null;
   }
-  /** What keeps the thread's latest ending from being judged now: a compaction or its workflow. */
+  /** What keeps the thread's latest ending from being judged now: a compaction, its workflow or its subthreads. */
   function holdReason(threadId: string): string | null {
     if (cursors.get(threadId)?.maintenance) return HELD_REASON.maintenance;
-    return workflowWait(threadId) ? HELD_REASON.workflow : null;
+    const wait = workWait(threadId);
+    return wait ? HELD_REASON[wait.kind] : null;
   }
-  /** The thread's latest ending when it waits to be judged: held, or its nudge withheld for the workflow. */
+  /** The thread's latest ending when it waits to be judged: held, or its nudge withheld for the work it waits on. */
   function heldEnding(threadId: string): RecoveryRecord | null {
     const record = latestRecords.get(threadId);
     if (!record) return null;
     if (record.action === "suppressed" && HELD[record.reason] === true) return record;
     const nudge = record.action === "nudged" ? options.continuation?.latest(threadId) : null;
-    return nudge?.state === "withheld" && nudge.cancelReason === WITHHELD_REASON.workflow
+    return nudge?.state === "withheld" && WAITED[nudge.cancelReason ?? ""] === true
       && nudge.runId === record.runId && nudge.messageId === record.messageId && nudge.messageRevision === record.messageRevision ? record : null;
   }
   /** Re-admits an unchanged held ending with fresh lifecycle checks, reusing its successful judgment when possible. */
@@ -352,44 +361,63 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     void serial(() => persist(record)).catch(caught => bb.log.warn(`Recovery hold persistence failed: ${String(caught)}`));
     changed();
   }
-  /** Hidden workflow steps are never judged themselves; their lifecycle is what their owner waits on. */
-  function noteWorkflowStep(thread: ObservedThread): void {
+  /** The root at the top of the chain a thread's work reports back up, as far as observed threads tell. */
+  function rootOf(threadId: string): string {
+    let root = threadId;
+    for (let depth = 0; depth < MAX_NESTING; depth++) {
+      const thread = latestThreads.get(root)?.thread;
+      const up = thread ? workflowOwner(thread) ?? thread.parentThreadId : null;
+      if (up === null) break;
+      root = up;
+    }
+    return root;
+  }
+  /**
+   * Workflow steps and subthreads are never judged themselves; their lifecycle is what their root waits on.
+   * A root learned late (its chain observed after the running thread) moves the work there on the next observation.
+   */
+  function noteRunningWork(thread: ObservedThread): void {
     const owner = workflowOwner(thread);
-    const runningFor = owner !== null && workflowStepRunning(thread) ? owner : null;
-    if (stepOwners.has(thread.id) && stepOwners.get(thread.id) !== runningFor) stepStopped(thread.id);
-    if (runningFor === null || stepOwners.has(thread.id)) return;
-    stepOwners.set(thread.id, runningFor);
-    runningSteps.set(runningFor, (runningSteps.get(runningFor) ?? new Set()).add(thread.id));
-    settling.delete(runningFor);
-    clearTimeout(settleTimers.get(runningFor));
-    settleTimers.delete(runningFor);
+    const reportsTo = owner ?? thread.parentThreadId;
+    const runningFor = reportsTo !== null && threadRunning(thread) ? rootOf(reportsTo) : null;
+    if (workRoots.has(thread.id) && workRoots.get(thread.id) !== runningFor) workStopped(thread.id);
+    if (runningFor === null || workRoots.has(thread.id)) return;
+    workRoots.set(thread.id, runningFor);
+    runningWork.set(runningFor, (runningWork.get(runningFor) ?? new Map()).set(thread.id, owner !== null ? "workflow" : "subthread"));
+    stopSettling(runningFor);
   }
-  function stepStopped(stepId: string): void {
-    const owner = stepOwners.get(stepId);
-    if (owner === undefined) return;
-    stepOwners.delete(stepId);
-    const steps = runningSteps.get(owner)!;
-    steps.delete(stepId);
-    if (steps.size) return;
-    runningSteps.delete(owner);
-    const until = Date.now() + WORKFLOW_SETTLE_MS;
-    settling.set(owner, until);
-    armSettle(owner, until);
+  function stopSettling(root: string): void {
+    settling.delete(root);
+    clearTimeout(settleTimers.get(root));
+    settleTimers.delete(root);
   }
-  function armSettle(owner: string, until: number): void {
-    clearTimeout(settleTimers.get(owner));
+  function workStopped(threadId: string): void {
+    const root = workRoots.get(threadId);
+    if (root === undefined) return;
+    workRoots.delete(threadId);
+    const work = runningWork.get(root)!;
+    const kind = work.get(threadId)!;
+    work.delete(threadId);
+    if (work.size) return;
+    runningWork.delete(root);
+    const until = Date.now() + SETTLE_MS;
+    settling.set(root, { until, kind });
+    armSettle(root, until);
+  }
+  function armSettle(root: string, until: number): void {
+    clearTimeout(settleTimers.get(root));
     const timer = setTimeout(() => {
-      settleTimers.delete(owner);
+      settleTimers.delete(root);
       void serial(async () => {
-        if (disposed || runningSteps.has(owner) || settling.get(owner) !== until) return;
-        if (until > Date.now()) { armSettle(owner, until); return; }
-        settling.delete(owner);
-        await release(owner);
+        if (disposed || runningWork.has(root) || settling.get(root)?.until !== until) return;
+        if (until > Date.now()) { armSettle(root, until); return; }
+        settling.delete(root);
+        await release(root);
         changed();
-      }).catch(caught => { if (!disposed) bb.log.warn(`Recovery workflow release deferred: ${String(caught)}`); });
+      }).catch(caught => { if (!disposed) bb.log.warn(`Recovery wait release deferred: ${String(caught)}`); });
     }, Math.max(0, until - Date.now()));
     timer.unref?.();
-    settleTimers.set(owner, timer);
+    settleTimers.set(root, timer);
   }
   function remember(thread: ObservedThread, event = false): ObservedThread {
     const previous = latestThreads.get(thread.id);
@@ -424,6 +452,8 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
   }
   function startRun(cursor: Cursor, threadId: string, turnId: string): void {
     if (cursor.runId !== turnId) cancelClassifications(GATE.superseded, "A later root execution superseded the classified ending", threadId);
+    // The settle bridged the gap until the work's report (or anyone) reached the root; this run's ending is judged on its own.
+    stopSettling(threadId);
     cursor.runId = turnId;
     cursor.finalMessage = null;
   }
@@ -530,7 +560,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
           const checkIn = jevCheckIn(judgment);
           const streak = options.continuation?.streak(record.threadId) ?? 0;
           if (judgment.classification === "continue" && options.continuation?.enabled(record.threadId)) {
-            // Workflow release may reuse this judgment, but admission and the nudge are always fresh.
+            // Release after a hold may reuse this judgment, but admission and the nudge are always fresh.
             const held = holdReason(record.threadId);
             if (held) decide(nextRecord, "suppressed", HELD_GATE[held]!, held);
             else if (streak >= NUDGE_STREAK_LIMIT) decide(nextRecord, "suppressed", GATE.nudgeStreak, NUDGE_STREAK_REASON);
@@ -599,7 +629,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     const selected = detector;
     const canClassify = (initialized || starting !== null) && !disposed && identitiesKnown && !paused
       && !window.paused && window.epoch === classificationEpoch && selected !== null;
-    // A thread waiting on its workflow keeps its ending unjudged until the wait ends.
+    // A thread waiting on its workflow or subthreads keeps its ending unjudged until the wait ends.
     const held = canClassify ? holdReason(thread.id) : null;
     const unclassifiedGate = !selected ? GATE.noDetector : paused || window.paused ? GATE.paused : !identitiesKnown ? GATE.identities : GATE.policyChanged;
     const { value: text, ref } = encodeText(ending.finalMessage.text);
@@ -694,7 +724,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
     const newer = freshest(thread);
     if (newer !== thread) { thread = newer; excluded = await exclusion(thread); }
     if (disposed) return;
-    noteWorkflowStep(thread);
+    noteRunningWork(thread);
     if (thread.archivedAt !== null || thread.deletedAt !== null) {
       cancelClassifications(GATE.archived, "Thread archived or deleted", thread.id);
       inventory.delete(thread.id); cursors.delete(thread.id); liveBaselines.delete(thread.id); tracker.forget(thread.id); return;
@@ -792,8 +822,8 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       for (const id of inventory.keys()) if (!seen.has(id) && !disposed) {
         try { await observe(remember(await bb.sdk.threads.get({ threadId: id })), window); }
         catch (caught) {
-          // A step that can no longer be read is no longer running for its owner.
-          stepStopped(id);
+          // Work that can no longer be read is no longer running for its root.
+          workStopped(id);
           bb.log.warn(`Recovery inventory confirmation deferred for ${id}: ${String(caught)}`);
         }
       }
@@ -931,7 +961,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       const cursor = cursors.get(threadId);
       if (disposed || !initialized || !cursor || inventory.get(threadId)?.exclusion !== null) return null;
       return { runId: cursor.runId, messageId: cursor.finalMessage?.id ?? null, messageRevision: cursor.finalMessage?.revision ?? null, knownStop: cursor.knownStop,
-        waitingForWorkflow: workflowWait(threadId) !== null };
+        waitingOn: workWait(threadId)?.kind ?? null };
     },
     threadState(threadId): RecoveryThreadState {
       const listed = inventory.get(threadId);
@@ -939,7 +969,7 @@ export function createRecoveryService(options: RecoveryServiceOptions): Recovery
       const cursor = cursors.get(threadId);
       return { thread: listed ? { ...listed, watched: tracker.isWatching(threadId) } : null, currentRunId: cursor?.runId ?? null,
         latestRecord: latest ? structuredClone(latest) : null, classifying: classifying(), paused, detectorId: detector?.id ?? null,
-        workflow: workflowWait(threadId), compacting: cursor?.maintenance != null };
+        wait: workWait(threadId), compacting: cursor?.maintenance != null };
     },
     validateBlocker(blocker) {
       return serial(async () => {

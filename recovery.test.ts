@@ -3,10 +3,10 @@ import { test } from "node:test";
 import { RECOVERY_NUDGE, type FinalMessageClassifier, type FinalMessageJudgment, type RecoveryBlocker, type RecoveryRecord, type RecoveryService, type ThreadEventRow } from "./recovery-contract.js";
 import { createFakePluginHost, makeMessageDispatchHookContext, makeQueueEntry, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { createRecoveryService } from "./recovery.js";
-import { DECISION_LIMITS, historyRecordIds, OUTCOME_WINDOW_MS } from "./decision-log.js";
+import { DECISION_LIMITS, GATE, historyRecordIds, OUTCOME_WINDOW_MS } from "./decision-log.js";
 import { CHECK_IN_MS, createContinuation, NUDGE_STREAK_LIMIT, SCHEDULED_REASON, type Continuation } from "./continuation.js";
 import { CANCEL_REASON, HELD_REASON, WITHHELD_REASON } from "./continuation-copy.js";
-import { WORKFLOW_SETTLE_MS } from "./workflow-steps.js";
+import { SETTLE_MS } from "./running-work.js";
 
 const emptyControls = async (): Promise<string[]> => [];
 function turn(threadId: string, runId: string, seq: number, completed = false): ThreadEventRow {
@@ -521,7 +521,7 @@ test("continue endings schedule one nudge per thread that is on; a thread turned
   for (const record of [first, second]) {
     const nudge = pending.find(row => row.threadId === record.threadId)!;
     assert.deepEqual([nudge.runId, nudge.messageId, nudge.messageRevision], [record.runId, record.messageId, record.messageRevision]);
-    assert.deepEqual(h.service.cursor(record.threadId), { runId: record.runId, messageId: record.messageId, messageRevision: record.messageRevision, knownStop: false, waitingForWorkflow: false });
+    assert.deepEqual(h.service.cursor(record.threadId), { runId: record.runId, messageId: record.messageId, messageRevision: record.messageRevision, knownStop: false, waitingOn: null });
   }
   assert.equal(h.continuation!.latest("thread-2"), null);
   assert.deepEqual(h.counts(), { classifications: 3, sends: 0 });
@@ -551,16 +551,16 @@ test("an owner's ending waits while its hidden workflow step runs, then is judge
   await h.continuation!.start(); await h.service.start();
   // The step itself stays a hidden worker: never judged, never nudged.
   assert.equal(h.service.status().threads.find(thread => thread.id === step.id)?.exclusion, "hidden");
-  assert.deepEqual(h.service.threadState(owner.id).workflow, { running: 1, settlingUntil: null });
+  assert.deepEqual(h.service.threadState(owner.id).wait, { kind: "workflow", running: 1, settlingUntil: null });
   await h.finish(0, "The fixture setup is complete; the workflow is running…");
   const held = await h.waitForRecord(owner.id, "suppressed");
   assert.equal(held.reason, HELD_REASON.workflow);
-  assert.equal(h.service.cursor(owner.id)?.waitingForWorkflow, true);
+  assert.equal(h.service.cursor(owner.id)?.waitingOn, "workflow");
   // The step ends; the owner still waits through the settle window for a next step or the finishing message.
   step.status = "idle"; step.updatedAt++;
   await h.harness.emitThreadEvent("thread.idle", { thread: step, lastAssistantText: null });
-  assert.deepEqual(h.service.threadState(owner.id).workflow, { running: 0, settlingUntil: 1_000 + WORKFLOW_SETTLE_MS });
-  t.mock.timers.tick(WORKFLOW_SETTLE_MS - 1);
+  assert.deepEqual(h.service.threadState(owner.id).wait, { kind: "workflow", running: 0, settlingUntil: 1_000 + SETTLE_MS });
+  t.mock.timers.tick(SETTLE_MS - 1);
   await h.service.refresh();
   assert.deepEqual(h.counts(), { classifications: 0, sends: 0 });
   t.mock.timers.tick(1);
@@ -568,7 +568,7 @@ test("an owner's ending waits while its hidden workflow step runs, then is judge
   assert.equal(nudged.id, held.id);
   assert.deepEqual(h.classified, ["The fixture setup is complete; the workflow is running…"]);
   assert.equal(h.continuation!.latest(owner.id)?.state, "pending");
-  assert.equal(h.service.threadState(owner.id).workflow, null);
+  assert.equal(h.service.threadState(owner.id).wait, null);
 });
 
 test("a new owner turn while its workflow runs supersedes the held ending; only the new ending is judged", async t => {
@@ -586,7 +586,7 @@ test("a new owner turn while its workflow runs supersedes the held ending; only 
   assert.equal(h.service.records()[0]!.reason, "A later root execution superseded the classified ending");
   step.status = "idle"; step.updatedAt++;
   await h.harness.emitThreadEvent("thread.idle", { thread: step, lastAssistantText: null });
-  t.mock.timers.tick(WORKFLOW_SETTLE_MS);
+  t.mock.timers.tick(SETTLE_MS);
   await h.service.refresh();
   assert.deepEqual(h.counts(), { classifications: 0, sends: 0 });
   h.history.get(owner.id)!.push(message(owner.id, "run-finishing", 11, "All four steps passed."), turn(owner.id, "run-finishing", 12, true));
@@ -609,7 +609,7 @@ test("a step starting during the countdown withholds the nudge; the unchanged en
   assert.equal(nudge.state, "pending");
   step.status = "active"; step.updatedAt++;
   await h.harness.emitThreadEvent("thread.active", { thread: step });
-  assert.equal(h.service.cursor(owner.id)?.waitingForWorkflow, true);
+  assert.equal(h.service.cursor(owner.id)?.waitingOn, "workflow");
   // Core runs the dispatch hook when the countdown sends.
   const decision = h.continuation!.decide(makeMessageDispatchHookContext({ thread: { id: owner.id, status: "idle" }, initiator: "system", input: { text: RECOVERY_NUDGE },
     experimental_submission: { pluginId: h.bb.pluginId, data: { continuationNudge: nudge.nudgeId } } }));
@@ -618,13 +618,66 @@ test("a step starting during the countdown withholds the nudge; the unchanged en
   assert.deepEqual([withheld.state, withheld.cancelReason], ["withheld", WITHHELD_REASON.workflow]);
   step.status = "idle"; step.updatedAt++;
   await h.harness.emitThreadEvent("thread.idle", { thread: step, lastAssistantText: null });
-  t.mock.timers.tick(WORKFLOW_SETTLE_MS);
+  t.mock.timers.tick(SETTLE_MS);
   await h.service.refresh();
   await h.waitForRecord(owner.id, "nudged");
   const again = h.continuation!.latest(owner.id)!;
   assert.notEqual(again.nudgeId, nudge.nudgeId);
   assert.deepEqual([again.state, again.messageId], ["pending", nudge.messageId]);
   assert.deepEqual(h.counts(), { classifications: 1, sends: 0 });
+});
+
+test("a parent's ending is not judged while its subthread runs; the subthread's report starts the run that is", async t => {
+  const h = fixture(2, async () => judgment("finished"), true); t.after(() => { h.continuation!.dispose(); return h.service.dispose(); });
+  const parent = h.threads[0]!, child = h.threads[1]!;
+  child.parentThreadId = parent.id;
+  await h.continuation!.start(); await h.service.start();
+  // The subthread itself is never judged.
+  assert.equal(h.service.status().threads.find(thread => thread.id === child.id)?.exclusion, "child");
+  assert.deepEqual(h.service.threadState(parent.id).wait, { kind: "subthread", running: 1, settlingUntil: null });
+  await h.finish(0, "Spawned a subthread for the migration; waiting for its report.");
+  const held = await h.waitForRecord(parent.id, "suppressed");
+  assert.deepEqual([held.reason, h.service.threadState(parent.id).latestRecord?.gate], [HELD_REASON.subthread, GATE.subthread]);
+  assert.equal(h.service.cursor(parent.id)?.waitingOn, "subthread");
+  // The subthread finishes and its report reaches the parent, which carries on.
+  child.status = "idle"; child.updatedAt++;
+  await h.harness.emitThreadEvent("thread.idle", { thread: child, lastAssistantText: null });
+  parent.status = "active"; parent.updatedAt++;
+  h.history.get(parent.id)!.push(turn(parent.id, "run-report", 10));
+  await h.harness.emitThreadEvent("thread.active", { thread: parent });
+  // The report run supersedes the held ending and ends the wait: its own ending stands on its own.
+  assert.equal(h.service.threadState(parent.id).latestRecord?.gate, GATE.superseded);
+  assert.equal(h.service.threadState(parent.id).wait, null);
+  h.history.get(parent.id)!.push(message(parent.id, "run-report", 11, "Migration merged; all done."), turn(parent.id, "run-report", 12, true));
+  parent.status = "idle"; parent.updatedAt++;
+  await h.harness.emitThreadEvent("thread.idle", { thread: parent, lastAssistantText: null });
+  await h.waitForRecord(parent.id, "finished");
+  assert.deepEqual(h.classified, ["Migration merged; all done."]);
+  assert.equal(h.continuation!.latest(parent.id), null);
+});
+
+test("a running nested subthread holds the root while its own parent idles; a root nobody reports back to is judged after the settle", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000 });
+  const h = fixture(3, undefined, true); t.after(() => { h.continuation!.dispose(); return h.service.dispose(); });
+  const root = h.threads[0]!, child = h.threads[1]!, grandchild = h.threads[2]!;
+  Object.assign(child, { parentThreadId: root.id, status: "idle" });
+  grandchild.parentThreadId = child.id;
+  await h.continuation!.start(); await h.service.start();
+  await h.finish(0, "Delegated the audit; its subthreads are working.");
+  const held = await h.waitForRecord(root.id, "suppressed");
+  assert.equal(held.reason, HELD_REASON.subthread);
+  grandchild.status = "idle"; grandchild.updatedAt++;
+  await h.harness.emitThreadEvent("thread.idle", { thread: grandchild, lastAssistantText: null });
+  assert.deepEqual(h.service.threadState(root.id).wait, { kind: "subthread", running: 0, settlingUntil: 1_000 + SETTLE_MS });
+  t.mock.timers.tick(SETTLE_MS - 1);
+  await h.service.refresh();
+  assert.deepEqual(h.counts(), { classifications: 0, sends: 0 });
+  // No report arrived (parent notifications off, say): the unchanged ending is judged once.
+  t.mock.timers.tick(1);
+  const nudged = await h.waitForRecord(root.id, "nudged");
+  assert.equal(nudged.id, held.id);
+  assert.deepEqual(h.classified, ["Delegated the audit; its subthreads are working."]);
+  assert.equal(h.service.threadState(root.id).wait, null);
 });
 
 test("the /compact turn that followed Task A's ending never replaces it: the real reply is judged once, after the compaction", async t => {
@@ -648,7 +701,7 @@ test("the /compact turn that followed Task A's ending never replaces it: the rea
   const record = await h.waitForRecord(thread.id, "nudged");
   assert.deepEqual([record.runId, record.messageId, record.classification], [runId, "message-349", "continue"]);
   assert.deepEqual(h.classified, ["The fixture setup is complete; the workflow is running…"]);
-  assert.deepEqual(h.service.cursor(thread.id), { runId, messageId: "message-349", messageRevision: 349, knownStop: false, waitingForWorkflow: false });
+  assert.deepEqual(h.service.cursor(thread.id), { runId, messageId: "message-349", messageRevision: 349, knownStop: false, waitingOn: null });
   assert.equal(h.service.threadState(thread.id).compacting, false);
   assert.deepEqual(h.continuation!.snapshot(thread.id).pending.map(nudge => nudge.messageId), ["message-349"]);
   assert.equal(h.service.records().length, 1);

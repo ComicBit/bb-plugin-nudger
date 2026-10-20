@@ -170,14 +170,20 @@ export interface RecoveryCursor {
   messageId: string | null;
   messageRevision: number | null;
   knownStop: boolean;
-  /** The thread started a workflow whose steps are still running (or only just finished); it must not be nudged. */
-  waitingForWorkflow: boolean;
+  /** Work the thread started still runs (or only just finished), so it has not stopped and must not be nudged; null when none. */
+  waitingOn: RecoveryWaitKind | null;
 }
 
-/** A thread waiting on its workflow: hidden step threads still running, or the settle window after the last one ended. */
-export interface RecoveryWorkflowWait {
+/** What a thread waits on: its workflow's hidden steps, or its subthreads (nested ones included). */
+export type RecoveryWaitKind = "workflow" | "subthread";
+
+/** A thread waiting on work it started: those threads still running, or the settle window after the last one ended. */
+export interface RecoveryWait {
+  /** A running workflow names the wait; otherwise what ended last does. */
+  kind: RecoveryWaitKind;
+  /** Running threads of that kind. */
   running: number;
-  /** When the wait ends with no step running; null while a step runs. */
+  /** When the wait ends with nothing running; null while something runs. */
   settlingUntil: number | null;
 }
 
@@ -192,8 +198,8 @@ export interface RecoveryThreadState {
   classifying: boolean;
   paused: boolean;
   detectorId: string | null;
-  /** The thread's workflow wait; null when it is not waiting on one. */
-  workflow: RecoveryWorkflowWait | null;
+  /** What the thread waits on; null when it waits on nothing. */
+  wait: RecoveryWait | null;
   /** A `/compact` maintenance turn is running; the last real reply is checked after it. */
   compacting: boolean;
 }

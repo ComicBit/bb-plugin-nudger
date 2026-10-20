@@ -243,7 +243,7 @@ export function createContinuation(options: ContinuationOptions): Continuation {
     if (cursor.knownStop) return WITHHELD_REASON.stop;
     if (cursor.runId !== nudge.runId) return WITHHELD_REASON.newerRun;
     if (cursor.messageId !== nudge.messageId || cursor.messageRevision !== nudge.messageRevision) return WITHHELD_REASON.messageChanged;
-    if (cursor.waitingForWorkflow) return WITHHELD_REASON.workflow;
+    if (cursor.waitingOn) return WITHHELD_REASON[cursor.waitingOn];
     if (context.thread.status !== "idle") return `${WITHHELD_REASON.notIdle}: ${context.thread.status}`;
     if (context.attempt !== "start-turn") return WITHHELD_REASON.joinTurn;
     return null;

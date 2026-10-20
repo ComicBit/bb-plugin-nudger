@@ -1,3 +1,5 @@
+import type { RecoveryWaitKind } from "./recovery-contract.js";
+
 /** Every word the operator sees about automatic continuation, and how each internal reason reads to them. */
 /** One status line: a primary phrase, then a quieter detail. */
 export interface Line { text: string; detail: string | null }
@@ -39,11 +41,13 @@ export const LINE = {
   compacting: line("Compacting the conversation", "I'll check the last reply after"),
   compacted: line("The conversation was compacted", NOT_SENT),
   workflowRan: line("Its workflow was running", NOT_SENT),
+  subthreadRan: line("A subthread was running", NOT_SENT),
   streak: line("Stopped nudging", "Its last nudges drew nothing new; any new message resumes"),
 } as const satisfies Record<string, Line>;
 
-/** The thread waits on the workflow it started: its steps, then a short settle before its last reply is checked. */
-export function workflowLine(running: number): Line {
+/** The thread waits on work it started (its workflow's steps or its subthreads), then a short settle before its last reply is checked. */
+export function waitLine(kind: RecoveryWaitKind, running: number): Line {
+  if (kind === "subthread") return line("Waiting for its subthreads", running === 0 ? "Finishing up" : `${running} still running`);
   return line("Waiting for its workflow", running === 0 ? "Finishing up" : running === 1 ? "1 step running" : `${running} steps running`);
 }
 
@@ -100,11 +104,14 @@ export const WITHHELD_REASON = {
   queued: "core queued the continuation instead of starting it",
   /** The thread's workflow steps are running (or only just finished). */
   workflow: "its workflow is still running",
+  /** The thread's subthreads are running (or only just finished). */
+  subthread: "its subthread is still running",
 } as const;
 
 /** Recovery holds a live ending unjudged with these reasons, then checks it once nothing holds it. */
 export const HELD_REASON = {
   workflow: "Waiting for its workflow; the ending is checked once its steps finish",
+  subthread: "Waiting for its subthreads; the ending is checked once they finish",
   maintenance: "Held while the conversation compacts; the ending is checked after",
 } as const;
 
@@ -126,6 +133,7 @@ export function withheldCopy(reason: string | null): Line {
   if (reason === WITHHELD_REASON.newerRun || reason === WITHHELD_REASON.messageChanged) return LINE.movedOn;
   if (reason === WITHHELD_REASON.joinTurn || reason === WITHHELD_REASON.queued || reason?.startsWith(WITHHELD_REASON.notIdle)) return LINE.busy;
   if (reason === WITHHELD_REASON.workflow) return LINE.workflowRan;
+  if (reason === WITHHELD_REASON.subthread) return LINE.subthreadRan;
   return LINE.lastSecond;
 }
 
@@ -145,6 +153,7 @@ const SUPPRESSED: Array<[prefix: string, copy: Line]> = [
   ["Classification result canceled while", LINE.movedOn],
   ["Classification routing canceled by newer", LINE.movedOn],
   [HELD_REASON.workflow, LINE.workflowRan],
+  [HELD_REASON.subthread, LINE.subthreadRan],
   [HELD_REASON.maintenance, LINE.compacted],
   [NUDGE_STREAK_REASON, LINE.streak],
   // The reply ended unread or while auto-continue was off; the thread is watched again now.

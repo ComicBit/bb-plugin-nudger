@@ -107,7 +107,7 @@ test("late migration combines legacy and new counters once, even after default i
     { key: "usage.detector.backfilled", value: "2026-09-01" },
   ]);
   await migrateHeadquarters({ store: h.bb.storage.kv, settings: h.settings, readPage: async () => legacy });
-  const cursor = { runId: "run", messageId: "message", messageRevision: 1, knownStop: false, waitingForWorkflow: false };
+  const cursor = { runId: "run", messageId: "message", messageRevision: 1, knownStop: false, waitingOn: null };
   const continuation = createContinuation({ bb: h.bb, cursor: () => cursor }); t.after(() => continuation.dispose());
   await continuation.start(); assert.equal(continuation.sentCount("thread"), 20);
   assert.equal(continuation.enabled("thread"), true);

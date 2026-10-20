@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { useBbNavigate, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./rpc-contract.js";
 import type { AttentionItem, NudgerStats, StatsRange } from "./stats.js";
+import { createStatsCache, type CachedStats } from "./stats-cache.js";
 import { BUTTON, FOCUS } from "./ui.js";
 
 const RANGES: readonly StatsRange[] = ["day", "week", "month"];
@@ -162,11 +163,18 @@ function AttentionList({ items, now, open }: { items: AttentionItem[]; now: numb
   </li>)}</ul>;
 }
 
+// Survives in-app navigation (the bundle stays loaded while the page unmounts) and, through storage, a reload.
+const statsCache = createStatsCache();
+
 export function NudgerStatsPage() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const connected = useRealtimeConnectionState() === "connected";
-  const [stats, setStats] = useState<NudgerStats | null>(null);
+  // Stale-while-revalidate: the last stats render at once, and each read replaces them.
+  const [cached, setCached] = useState<CachedStats | null>(() => statsCache.read(Date.now()));
+  const stats = cached?.stats ?? null;
+  // Whether a read during this visit confirmed the stats on screen.
+  const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [range, chooseRange] = useStoredRange();
@@ -177,28 +185,40 @@ export function NudgerStatsPage() {
     try {
       do {
         live.current.again = false;
-        const next = await rpc.call("nudger_stats_v1", { version: 1 });
+        const entry = { syncedAt: Date.now(), stats: await rpc.call("nudger_stats_v1", { version: 1 }) };
+        // Kept even when the page has closed meanwhile: the next visit opens on it.
+        statsCache.save(entry);
         if (!live.current.mounted) return;
-        setStats(next); setNow(Date.now()); setError(null);
+        setCached(entry); setConfirmed(true); setNow(Date.now()); setError(null);
       } while (live.current.again);
-    } catch (cause) { if (live.current.mounted) setError(cause instanceof Error ? cause.message : "Could not load Nudger stats. Try again."); }
+    } catch (cause) {
+      if (live.current.mounted) { setError(cause instanceof Error ? cause.message : "Could not load Nudger stats. Try again."); setNow(Date.now()); }
+    }
     finally { live.current.running = false; }
   }, [rpc]);
-  useEffect(() => { live.current.mounted = true; return () => { live.current.mounted = false; }; }, []);
+  useEffect(() => { live.current.mounted = true; return () => { live.current.mounted = false; statsCache.persist(); }; }, []);
   useEffect(() => { void refresh(); }, [refresh, connected]);
   useRealtime("nudger-changed-v1", () => { void refresh(); });
   // Ages stay current between changes.
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 60_000); return () => clearInterval(timer); }, []);
   const open = (threadId: string) => navigate.toThread(threadId);
+  // Only stats already on screen get a quiet note; with nothing cached the loading line and error banner speak.
+  const freshness = !cached ? null : error !== null
+    ? <>Couldn’t refresh · updated {ago(cached.syncedAt, now)}</>
+    : !confirmed ? "Updating…" : null;
 
   return <div className="@container/stats h-full min-h-0 overflow-y-auto text-foreground">
-    <div className="mx-auto w-full max-w-6xl space-y-4 p-4 @min-[40rem]/stats:p-6" aria-busy={!stats && !error}>
-      {error && <div className="flex items-center gap-3" role="alert"><p className="min-w-0 flex-1 text-xs text-destructive">{error}</p><button type="button" className={BUTTON} onClick={() => { void refresh(); }}>Try again</button></div>}
+    <div className="mx-auto w-full max-w-6xl space-y-4 p-4 @min-[40rem]/stats:p-6" aria-busy={!confirmed && !error}>
+      {error && !stats && <div className="flex items-center gap-3" role="alert"><p className="min-w-0 flex-1 text-xs text-destructive">{error}</p><button type="button" className={BUTTON} onClick={() => { void refresh(); }}>Try again</button></div>}
       {!stats && !error && <p className="text-xs text-muted-foreground" role="status">Loading Nudger stats…</p>}
       {stats && <div className="grid grid-cols-1 gap-6 @min-[56rem]/stats:grid-cols-2">
         <div className="min-w-0 space-y-4">
           <div className="flex items-center justify-between gap-3">
-            <h1 className="text-base font-medium">Statistics</h1>
+            <div className="flex min-w-0 items-baseline gap-2">
+              <h1 className="shrink-0 text-base font-medium">Statistics</h1>
+              {freshness && <p className="min-w-0 truncate text-xs text-muted-foreground" role="status" title={error ?? undefined}>{freshness}</p>}
+              {error && <button type="button" className={`shrink-0 cursor-pointer rounded-sm text-xs text-foreground underline-offset-4 hover:underline ${FOCUS}`} onClick={() => { void refresh(); }}>Try again</button>}
+            </div>
             <div className="inline-flex rounded-md border border-input p-0.5" role="group" aria-label="Chart range">
               {RANGES.map(value => <button key={value} type="button" aria-pressed={range === value} onClick={() => chooseRange(value)}
                 className={`h-6 cursor-pointer rounded-[5px] px-2.5 text-xs font-medium transition-colors duration-150 hover:duration-0 ${range === value ? "bg-state-hover text-foreground" : "text-muted-foreground hover:text-foreground"} ${FOCUS}`}>{rangeText[value].button}</button>)}

@@ -39,6 +39,7 @@ export const GATE = {
   policyChanged: "policy-changed",
   cancelledBeforeStart: "cancelled-before-classification",
   workflow: "workflow-hold",
+  subthread: "subthread-hold",
   maintenance: "maintenance",
   superseded: "superseded",
   stop: "operator-stop",
@@ -98,6 +99,7 @@ export function nudgeGate(state: RecoveryNudgeDecision["state"], reason: string 
   if (reason === WITHHELD_REASON.newerRun) return GATE.superseded;
   if (reason === WITHHELD_REASON.messageChanged) return GATE.messageChanged;
   if (reason === WITHHELD_REASON.workflow) return GATE.workflow;
+  if (reason === WITHHELD_REASON.subthread) return GATE.subthread;
   if (reason === WITHHELD_REASON.joinTurn || reason?.startsWith(WITHHELD_REASON.notIdle)) return GATE.activeExecution;
   if (reason === WITHHELD_REASON.queued) return GATE.queued;
   return GATE.nudgeWithheld;
