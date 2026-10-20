@@ -131,5 +131,9 @@ Run these in an isolated checkout without live messages/models. Node tests use t
 
 The npm package includes its own sources, styles, SDK-pinned development metadata and built `dist` artifacts. `prepack` builds the package so a published npm archive includes BB's metadata-stamped server/app bundles. Source tests, build source maps (which can contain local build paths), and unrelated Headquarters code are excluded from distribution. This repository change prepares the package; it does not publish a release or run a paid comparison.
 
-No project license is declared yet. Choose licensing before public distribution; the included Lucide notice covers that artwork, not permission to redistribute the entire plugin.
+## License
+
+Copyright 2026 ComicBit. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).
+
+The Lucide hand artwork retains its separate ISC/Feather MIT notices in [lucide-LICENSE.txt](lucide-LICENSE.txt).
 

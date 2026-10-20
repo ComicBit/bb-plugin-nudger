@@ -1,6 +1,7 @@
 {
   "name": "bb-plugin-nudger",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "Keep unfinished agent work moving with guarded continuation, composer controls, and local statistics.",
   "type": "module",
   "repository": { "type": "git", "url": "https://github.com/ComicBit/bb-plugin-nudger.git" },
@@ -14,7 +15,7 @@
     "app": "./app.tsx",
     "skills": ["skills/nudger"]
   },
-  "files": ["dist", "!dist/*.map", "*.ts", "*.tsx", "*.css", "!*.test.ts", "skills/", "hand.svg", "tsconfig.json", "README.md", "PLUGIN_OVERVIEW.md", "lucide-LICENSE.txt"],
+  "files": ["dist", "!dist/*.map", "*.ts", "*.tsx", "*.css", "!*.test.ts", "skills/", "hand.svg", "tsconfig.json", "README.md", "PLUGIN_OVERVIEW.md", "LICENSE", "lucide-LICENSE.txt"],
   "scripts": {
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
